@@ -37,11 +37,12 @@ Output variables, M = 4 * n_queries * n_lambda:
     gamma / bound_type / query_id / source_row_index   (M,1) diagnostics, not trained on
 """
 import math
-import numpy as np
+
 import networkx as nx
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as F  # noqa: N812
 
 # ---- PFN Studio compatibility shim -----------------------------------------
 try:
