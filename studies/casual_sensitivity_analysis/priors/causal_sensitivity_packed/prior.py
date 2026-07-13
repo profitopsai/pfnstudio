@@ -83,7 +83,7 @@ def standard_normal_logprob(u):
 def batched_spline_forward(base_u, spline_params, cfg):
     """1D rational-quadratic spline flow over (B,m,S). Ported from the authors.
     Returns transformed samples u and their log-density log_p_eta."""
-    B, m, S = base_u.shape
+    _B, _m, _S = base_u.shape
     nb = cfg.num_bins
     base_u = base_u.contiguous()
     widths = spline_params[..., :nb]
@@ -357,7 +357,7 @@ def _lr_mult_for_lambda(lam, scfg):
 def _max_steps_for_lambda(lam, scfg, lr_mult):
     """Authors' 'inverse_sqrt_lr' max-steps-by-lambda schedule (more steps when lr is smaller)."""
     step_mult = min(scfg.max_steps_max_mult, max(1.0, 1.0 / math.sqrt(lr_mult)))
-    return int(math.ceil(scfg.max_steps * step_mult))
+    return math.ceil(scfg.max_steps * step_mult)
 
 
 def _clip_spline_grad_per_query(sp_param, max_norm):
@@ -537,7 +537,10 @@ if __name__ == "__main__":
     print(f"sample() took {time.time() - t0:.2f}s")
     for k, v in out.items():
         print(f"  {k:18s} {getattr(v, 'shape', '()')}  {v.dtype}")
-    X = out["X"]; n = int(out["n_ctx"]); M = out["theta_star"].shape[0]; D = 10
+    X = out["X"]
+    n = int(out["n_ctx"])
+    M = out["theta_star"].shape[0]
+    D = 10
     assert X.shape == (n + M, D + 5), f"X must be (n_ctx+M, D+5), got {X.shape}"
     assert (X[:n, D + 4] == 1.0).all(), "is_context must be 1 on context rows"
     assert (X[n:, D + 4] == 0.0).all(), "is_context must be 0 on query rows"
