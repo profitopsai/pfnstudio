@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from typing import Any, Callable
-
 import random
-import numpy as np
+from collections.abc import Callable
+from typing import Any
+
 import networkx as nx
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from pfnstudio_core import Prior, register_prior
 
 
@@ -554,9 +554,10 @@ def sample_do_pfn_torch_batch(
     scm.undo_interventions()
 
     x_candidates = list(set(graph.nodes) - {scm.t_key, scm.y_key})
-    x_keys = [scm.t_key] + list(
-        np.random.choice(x_candidates, size=num_features, replace=False)
-    )
+    x_keys = [
+        scm.t_key,
+        *np.random.choice(x_candidates, size=num_features, replace=False),
+    ]
 
     x_obs = torch.stack([sample_obs[key] for key in x_keys]).permute(-1, 1, 0)
     x_int = torch.stack([sample_int[key] for key in x_keys]).permute(-1, 1, 0)

@@ -177,7 +177,7 @@ class BarDistributionHead:
     # ── generic custom-loss hook (bucketized NLL) ──────────────────────────
     def loss(self, logits: Any, target: Any) -> Any:
         import torch
-        import torch.nn.functional as F
+        import torch.nn.functional as F  # noqa: N812
 
         borders = self.proj.bar_borders.to(device=logits.device, dtype=logits.dtype)
         nb = borders.numel() - 1
@@ -262,7 +262,7 @@ class BarDistributionHead:
 
     # ── generic prediction-reduction hook (distribution mean) ──────────────
     def to_prediction(self, output: Any) -> Any:
-        import torch.nn.functional as F
+        import torch.nn.functional as F  # noqa: N812
 
         borders = self.proj.bar_borders
         centers = 0.5 * (borders[1:] + borders[:-1])  # (nb,)
