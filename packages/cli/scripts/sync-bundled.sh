@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pre-build sync — copies the repo-root schemas/ and templates/ into
+# Pre-build sync — copies the repo-root schemas/ and starters/ into
 # packages/cli/pfnstudio/_bundled/ so they're inside the package
 # tree at `python -m build` time. The CLI's `validate` and `init`
 # commands read from this _bundled path at runtime.
@@ -19,7 +19,7 @@ BUNDLED="$PKG_DIR/pfnstudio/_bundled"
 
 mkdir -p "$BUNDLED"
 
-for src in schemas templates; do
+for src in schemas starters; do
   if [[ ! -d "$REPO_ROOT/$src" ]]; then
     echo "ERROR: $REPO_ROOT/$src not found" >&2
     exit 1

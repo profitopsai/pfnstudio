@@ -203,9 +203,7 @@ class DoPfnCidRecoveryScorer(DatasetScorer):
         picp_n = 0
 
         for k in range(NUM_TASKS):
-            task = prior.sample(
-                seed=BASE_SEED + k, num_samples=SCORER_POINTS, oracle_mc=ORACLE_MC
-            )
+            task = prior.sample(seed=BASE_SEED + k, num_samples=SCORER_POINTS, oracle_mc=ORACLE_MC)
             seq = task.get("X")
             y_q = task.get("y")
             n_ctx = task.get("n_ctx")
@@ -301,9 +299,7 @@ class DoPfnCidRecoveryScorer(DatasetScorer):
         oracle_cate_mse = 0.0  # oracle predicts its own cate_true → floor is 0
         ate_error = abs(sum_cate_pfn / n_cate - sum_cate_true / n_cate)
         cid_nmse = (nmse_cid_sum / nmse_cid_tasks) if nmse_cid_tasks else float("nan")
-        cate_nmse = (
-            (nmse_cate_sum / nmse_cate_tasks) if nmse_cate_tasks else float("nan")
-        )
+        cate_nmse = (nmse_cate_sum / nmse_cate_tasks) if nmse_cate_tasks else float("nan")
         picp_90 = (picp_hit / picp_n) if picp_n else float("nan")
         picp_90_gap = abs(picp_90 - PICP_MASS) if picp_n else float("nan")
 

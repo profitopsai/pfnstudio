@@ -64,7 +64,7 @@ Documentation = "https://github.com/profitopsai/pfnstudio/tree/main/docs"
 [tool.hatch.build.targets.wheel]
 packages = ["pfnstudio"]
 # _bundled/ is populated by scripts/sync-bundled.sh before build —
-# schemas/ and templates/ live at the repo root for development and
+# schemas/ and starters/ live at the repo root for development and
 # get copied in for packaging. The build no longer reaches outside
 # the package dir (which is rejected by `python -m build` isolation
 # and Python 3.13's stricter tarfile filter).

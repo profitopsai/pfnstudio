@@ -86,27 +86,21 @@ class BarDistributionHead:
         # state_dict and restored at inference. Placeholder until setup() fits
         # it to the prior; a wide linspace keeps predict sane even if a
         # checkpoint predates setup.
-        self.proj.register_buffer(
-            "bar_borders", torch.linspace(-3.0, 3.0, self.num_buckets + 1)
-        )
+        self.proj.register_buffer("bar_borders", torch.linspace(-3.0, 3.0, self.num_buckets + 1))
 
     def __call__(self, x: Any) -> Any:
         # (B, N, d_model) -> (B, N, num_buckets) per-bucket logits.
         return self.proj(x)
 
     # ── generic pre-training setup hook ────────────────────────────────────
-    def setup(
-        self, *, prior: Any, hp: dict | None = None, device: Any = None, **_: Any
-    ) -> None:
+    def setup(self, *, prior: Any, hp: dict | None = None, device: Any = None, **_: Any) -> None:
         import numpy as np
         import torch
 
         pooled: list[np.ndarray] = []
         for i in range(_SETUP_TASKS):
             try:
-                task = prior.sample(
-                    seed=_SETUP_BASE_SEED + i, num_samples=_SETUP_POINTS
-                )
+                task = prior.sample(seed=_SETUP_BASE_SEED + i, num_samples=_SETUP_POINTS)
             except TypeError:
                 # Prior.sample without a num_samples kwarg — fall back to defaults.
                 task = prior.sample(seed=_SETUP_BASE_SEED + i)
@@ -120,11 +114,7 @@ class BarDistributionHead:
                 ycol = X[:, -1]
                 pooled.append(ycol[np.isfinite(ycol)])
 
-        ally = (
-            np.concatenate([p for p in pooled if p.size])
-            if pooled
-            else np.zeros(1, np.float32)
-        )
+        ally = np.concatenate([p for p in pooled if p.size]) if pooled else np.zeros(1, np.float32)
         ally = ally[np.isfinite(ally)]
         print(
             "[bar_distribution_head] setup pooled outcomes "
