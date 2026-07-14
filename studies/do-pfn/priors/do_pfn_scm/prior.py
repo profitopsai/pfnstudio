@@ -91,9 +91,7 @@ class StructuralCausalModel:
         self.endogenous_vars[name] = None
         self.functions[name] = (function, param_varnames)
 
-    def add_exogenous_var(
-        self, name: str, distribution: Callable, distribution_kwargs: dict
-    ):
+    def add_exogenous_var(self, name: str, distribution: Callable, distribution_kwargs: dict):
         name = name.upper()
         self.exogenous_vars[name] = None
         self.exogenous_distributions[name] = (distribution, distribution_kwargs)
@@ -392,9 +390,7 @@ def _extract_equations(scm, graph, k: int):
     return eqs
 
 
-def _build_oracle_noise(
-    n: int, k: int, equations, sigma_exo: float, sigma_eps: float, rng
-):
+def _build_oracle_noise(n: int, k: int, equations, sigma_exo: float, sigma_eps: float, rng):
     """Root (exogenous) nodes ~ N(0, sigma_exo); non-roots ~ N(0, sigma_eps) —
     matching the torch prior's exogenous vs additive-noise split."""
     eps = np.empty((n, k), dtype=np.float64)
@@ -453,8 +449,7 @@ def monte_carlo_oracle_cate(
     """
     n = observed_values.shape[0]
     base = {
-        int(node): observed_values[:, i].astype(np.float64)
-        for i, node in enumerate(cov_indices)
+        int(node): observed_values[:, i].astype(np.float64) for i, node in enumerate(cov_indices)
     }
     one_lvl = np.full(n, float(t_level_for_one), dtype=np.float64)
     zero_lvl = np.full(n, float(t_level_for_zero), dtype=np.float64)
@@ -462,12 +457,12 @@ def monte_carlo_oracle_cate(
     acc_zero = np.zeros(n, dtype=np.float64)
     for _ in range(int(n_mc)):
         eps = _build_oracle_noise(n, k, equations, sigma_exo, sigma_eps, rng)
-        acc_one += _oracle_forward(
-            equations, topo_order, eps, {**base, int(t_idx): one_lvl}
-        )[:, y_idx]
-        acc_zero += _oracle_forward(
-            equations, topo_order, eps, {**base, int(t_idx): zero_lvl}
-        )[:, y_idx]
+        acc_one += _oracle_forward(equations, topo_order, eps, {**base, int(t_idx): one_lvl})[
+            :, y_idx
+        ]
+        acc_zero += _oracle_forward(equations, topo_order, eps, {**base, int(t_idx): zero_lvl})[
+            :, y_idx
+        ]
     return ((acc_one - acc_zero) / int(n_mc)).astype(np.float32)
 
 
@@ -696,19 +691,14 @@ def sample_do_pfn_studio_task(
             n_mc=int(oracle_mc),
             rng=o_rng,
         )
-        meta["cate_true_source"] = (
-            f"monte_carlo_oracle_do1_minus_do0(n_mc={int(oracle_mc)})"
-        )
+        meta["cate_true_source"] = f"monte_carlo_oracle_do1_minus_do0(n_mc={int(oracle_mc)})"
     else:
         # Cheap fallback used at train time (the trainer never reads cate_true):
         # a single-draw interventional-minus-observational contrast. This is
         # NOT the CATE — request oracle_mc>0 (the eval does) for a real CATE.
-        cate_true = (
-            (batch.target_y[:, 0, 0] - batch.y[:, 0, 0])
-            .cpu()
-            .numpy()
-            .astype(np.float32)
-        )[:num_samples]
+        cate_true = ((batch.target_y[:, 0, 0] - batch.y[:, 0, 0]).cpu().numpy().astype(np.float32))[
+            :num_samples
+        ]
         meta["cate_true_source"] = "single_draw_interventional_minus_observational"
 
     out = {

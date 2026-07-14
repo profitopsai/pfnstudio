@@ -48,7 +48,7 @@ def _sample_cascade_dag(
             break
 
     starts = np.concatenate(([0], np.cumsum(sizes)[:-1]))
-    layers = [list(range(int(s), int(s) + int(sz))) for s, sz in zip(starts, sizes)]
+    layers = [list(range(int(s), int(s) + int(sz))) for s, sz in zip(starts, sizes, strict=False)]
 
     adj = np.zeros((N, N), dtype=np.float32)
     for src_li, src_layer in enumerate(layers):

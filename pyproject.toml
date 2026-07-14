@@ -23,9 +23,11 @@ ignore = [
 "priors/**/*.py" = ["N803", "N806", "RUF012"]
 "studies/**/*.py" = ["N803", "N806", "RUF012"]
 "templates/**/*.py" = ["N803", "N806", "RUF012"]
+"starters/**/*.py" = ["N803", "N806", "RUF012"]
 "tests/**/*.py" = ["N803", "N806", "RUF012", "E402"]
 "examples/**/*.py" = ["N803", "N806"]
 "packages/core/pfnstudio_core/axes/*.py" = ["N806", "N812"]
+"packages/core/pfnstudio_core/blocks/*.py" = ["N803", "N806", "N812"]
 "packages/core/pfnstudio_core/scorers/*.py" = ["N806"]
 "packages/core/pfnstudio_core/training/*.py" = ["N806"]
 # typer/click idiom: Argument/Option calls in defaults are how the framework

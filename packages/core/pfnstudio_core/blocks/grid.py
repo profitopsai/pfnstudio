@@ -38,6 +38,7 @@ from ..registry import register_block
 # (see each __init__) if torch isn't installed.
 try:
     import torch.nn as nn
+
     _Module = nn.Module
 except ImportError:  # pragma: no cover — torch is a required dep for these blocks
     _Module = object  # type: ignore[assignment]
@@ -135,7 +136,7 @@ def _sdpa_call(F: Any, q: Any, k: Any, v: Any, **kwargs: Any) -> Any:
     import torch
 
     try:
-        from torch.nn.attention import sdpa_kernel, SDPBackend  # type: ignore[attr-defined]
+        from torch.nn.attention import SDPBackend, sdpa_kernel  # type: ignore[attr-defined]
 
         # EFFICIENT_ATTENTION first (fast), MATH as fallback if the
         # shape/dtype combo isn't supported by EFFICIENT. The chunked
@@ -244,9 +245,7 @@ class TabularCellEmbedder(_Module):
                 f"projection (d_model // 4 → d_model); got d_model={d_model}."
             )
         if features_per_group < 1:
-            raise ValueError(
-                f"features_per_group must be ≥ 1; got {features_per_group}."
-            )
+            raise ValueError(f"features_per_group must be ≥ 1; got {features_per_group}.")
 
         self.d_model = d_model
         self.features_per_group = features_per_group
@@ -287,8 +286,7 @@ class TabularCellEmbedder(_Module):
 
         if x.dim() != 4:
             raise ValueError(
-                f"tabular_cell_embedder expects 4-D input (B, R, C, 2); "
-                f"got shape {tuple(x.shape)}."
+                f"tabular_cell_embedder expects 4-D input (B, R, C, 2); got shape {tuple(x.shape)}."
             )
         B, R, C, two = x.shape
         if two != ENCODING_SIZE_MULTIPLIER:
@@ -309,8 +307,12 @@ class TabularCellEmbedder(_Module):
         if rem:
             pad = F - rem
             zeros = torch.zeros(
-                B, R, pad, ENCODING_SIZE_MULTIPLIER,
-                device=x.device, dtype=x.dtype,
+                B,
+                R,
+                pad,
+                ENCODING_SIZE_MULTIPLIER,
+                device=x.device,
+                dtype=x.dtype,
             )
             x = torch.cat([x, zeros], dim=2)
             C_padded = C + pad
@@ -451,18 +453,15 @@ class AlongRowAttention(_Module):
         torch.Tensor of shape ``(B, R, C', E)``.
         """
         import torch  # noqa: F401  — used implicitly via the .reshape methods
-        import torch.nn.functional as F
 
         if x.dim() != 4:
             raise ValueError(
-                f"along_row_attention expects 4-D input (B, R, C', E); "
-                f"got shape {tuple(x.shape)}."
+                f"along_row_attention expects 4-D input (B, R, C', E); got shape {tuple(x.shape)}."
             )
         B, R, Cp, E = x.shape
-        if E != self.d_model:
+        if self.d_model != E:
             raise ValueError(
-                f"along_row_attention expects last dim = d_model = "
-                f"{self.d_model}; got {E}."
+                f"along_row_attention expects last dim = d_model = {self.d_model}; got {E}."
             )
 
         H, D = self.n_heads, self.head_dim
@@ -639,7 +638,6 @@ class AlongColumnAttention(_Module):
         construction.
         """
         import torch
-        import torch.nn.functional as F
 
         if x.dim() != 4:
             raise ValueError(
@@ -647,10 +645,9 @@ class AlongColumnAttention(_Module):
                 f"got shape {tuple(x.shape)}."
             )
         B, Cp, R, E = x.shape
-        if E != self.d_model:
+        if self.d_model != E:
             raise ValueError(
-                f"along_column_attention expects last dim = d_model = "
-                f"{self.d_model}; got {E}."
+                f"along_column_attention expects last dim = d_model = {self.d_model}; got {E}."
             )
 
         H, D = self.n_heads, self.head_dim
@@ -675,7 +672,10 @@ class AlongColumnAttention(_Module):
             v_BHSD = v_BcNHD.transpose(1, 2)
             # GQA: q has H heads, k/v has 1 — PyTorch broadcasts internally.
             attn_BHSD = _sdpa_no_flash(
-                q_BHSD, k_BHSD, v_BHSD, enable_gqa=True,
+                q_BHSD,
+                k_BHSD,
+                v_BHSD,
+                enable_gqa=True,
             )
             attn_BSHD = attn_BHSD.transpose(1, 2)  # (Bc, R, H, D)
 
@@ -683,9 +683,7 @@ class AlongColumnAttention(_Module):
             # K and V are projected from train rows only.
             N = R if single_eval_pos is None else single_eval_pos
             if not (0 <= N <= R):
-                raise ValueError(
-                    f"single_eval_pos must be in [0, R={R}]; got {single_eval_pos}."
-                )
+                raise ValueError(f"single_eval_pos must be in [0, R={R}]; got {single_eval_pos}.")
 
             x_train = x_flat[:, :N]
             k_train = self._k_projection(x_train).view(Bc, N, H, D)
@@ -697,7 +695,9 @@ class AlongColumnAttention(_Module):
                 k_BHSD = k_train.transpose(1, 2)  # (Bc, H, N, D)
                 v_BHSD = v_train.transpose(1, 2)
                 attn_BHSD = _sdpa_no_flash(
-                    q_BHSD, k_BHSD, v_BHSD,
+                    q_BHSD,
+                    k_BHSD,
+                    v_BHSD,
                 )
                 attn_BSHD = attn_BHSD.transpose(1, 2)
 
@@ -836,18 +836,13 @@ class AxialAttentionBlock(_Module):
         super().__init__()
 
         if norm_position not in ("pre", "post"):
-            raise ValueError(
-                f"norm_position must be 'pre' or 'post'; got {norm_position!r}."
-            )
+            raise ValueError(f"norm_position must be 'pre' or 'post'; got {norm_position!r}.")
         if mlp_init not in ("default", "zero_second_linear"):
             raise ValueError(
-                f"mlp_init must be 'default' or 'zero_second_linear'; "
-                f"got {mlp_init!r}."
+                f"mlp_init must be 'default' or 'zero_second_linear'; got {mlp_init!r}."
             )
         if mlp_activation not in ("gelu", "relu"):
-            raise ValueError(
-                f"mlp_activation must be 'gelu' or 'relu'; got {mlp_activation!r}."
-            )
+            raise ValueError(f"mlp_activation must be 'gelu' or 'relu'; got {mlp_activation!r}.")
         if ff_mult < 1:
             raise ValueError(f"ff_mult must be ≥ 1; got {ff_mult}.")
 
@@ -858,10 +853,14 @@ class AxialAttentionBlock(_Module):
         # tested individually. As nn.Module subclasses they nest
         # cleanly into this block's parameter discovery.
         self._row_attn = AlongRowAttention(
-            d_model=d_model, n_heads=n_heads, head_dim=head_dim,
+            d_model=d_model,
+            n_heads=n_heads,
+            head_dim=head_dim,
         )
         self._col_attn = AlongColumnAttention(
-            d_model=d_model, n_heads=n_heads, head_dim=head_dim,
+            d_model=d_model,
+            n_heads=n_heads,
+            head_dim=head_dim,
         )
 
         # Three post- (or pre-) norms. ``elementwise_affine=False``
@@ -947,9 +946,7 @@ class AxialAttentionBlock(_Module):
 
         # ── 3. Position-wise MLP sub-block.
         if self.norm_position == "pre":
-            mlp_out = self._mlp_linear2(
-                self._mlp_act(self._mlp_linear1(self._ln_mlp(x)))
-            )
+            mlp_out = self._mlp_linear2(self._mlp_act(self._mlp_linear1(self._ln_mlp(x))))
             x = x + mlp_out
         else:  # post
             mlp_out = self._mlp_linear2(self._mlp_act(self._mlp_linear1(x)))
@@ -1001,8 +998,7 @@ class RowPoolForHead(_Module):
             import torch  # noqa: F401  — required for nn.Module super
         except ImportError as e:
             raise ImportError(
-                "row_pool_for_head requires torch. "
-                "Install with: pip install pfnstudio-core[torch]"
+                "row_pool_for_head requires torch. Install with: pip install pfnstudio-core[torch]"
             ) from e
         super().__init__()
 
@@ -1027,8 +1023,7 @@ class RowPoolForHead(_Module):
         """
         if x.dim() != 4:
             raise ValueError(
-                f"row_pool_for_head expects 4-D input (B, R, C', E); "
-                f"got shape {tuple(x.shape)}."
+                f"row_pool_for_head expects 4-D input (B, R, C', E); got shape {tuple(x.shape)}."
             )
         Cp = x.shape[2]
         if self.target_col >= Cp:
@@ -1087,11 +1082,10 @@ class GridPreprocessor(_Module):
 
     def __init__(self) -> None:
         try:
-            import torch.nn as nn
+            import torch.nn as nn  # noqa: F401
         except ImportError as e:  # pragma: no cover — torch is a required dep
             raise ImportError(
-                "grid_preprocessor requires torch. "
-                "Install with: pip install pfnstudio-core[torch]"
+                "grid_preprocessor requires torch. Install with: pip install pfnstudio-core[torch]"
             ) from e
         super().__init__()
 
