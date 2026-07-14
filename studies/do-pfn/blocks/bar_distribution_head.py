@@ -41,31 +41,9 @@ from pfnstudio_core.registry import register_block
 # How many prior tasks to pool when fitting bucket borders in setup(), and how
 # many points to draw per task (small — this is a one-time border fit, not
 # training). ~40 × 256 gives enough samples to place 100 equal-mass borders.
-_SETUP_TASKS: int = 10_000
+_SETUP_TASKS: int = 40
 _SETUP_POINTS: int = 256
 _SETUP_BASE_SEED: int = 987_654
-
-
-def _bar_tensor_stats(name: str, tensor: Any) -> dict[str, Any]:
-    import torch
-
-    t = tensor.detach()
-    finite = torch.isfinite(t)
-    out: dict[str, Any] = {
-        "name": name,
-        "shape": tuple(t.shape),
-        "numel": int(t.numel()),
-        "finite": int(finite.sum().item()),
-        "nan": int(torch.isnan(t).sum().item()),
-        "posinf": int(torch.isposinf(t).sum().item()),
-        "neginf": int(torch.isneginf(t).sum().item()),
-    }
-    if finite.any():
-        vals = t[finite]
-        out["min"] = float(vals.min().item())
-        out["max"] = float(vals.max().item())
-        out["max_abs"] = float(vals.abs().max().item())
-    return out
 
 
 @register_block("bar_distribution_head")
@@ -95,18 +73,14 @@ class BarDistributionHead:
         return self.proj(x)
 
     # ── generic pre-training setup hook ────────────────────────────────────
-    def setup(
-        self, *, prior: Any, hp: dict | None = None, device: Any = None, **_: Any
-    ) -> None:
+    def setup(self, *, prior: Any, hp: dict | None = None, device: Any = None, **_: Any) -> None:
         import numpy as np
         import torch
 
         pooled: list[np.ndarray] = []
         for i in range(_SETUP_TASKS):
             try:
-                task = prior.sample(
-                    seed=_SETUP_BASE_SEED + i, num_samples=_SETUP_POINTS
-                )
+                task = prior.sample(seed=_SETUP_BASE_SEED + i, num_samples=_SETUP_POINTS)
             except TypeError:
                 # Prior.sample without a num_samples kwarg — fall back to defaults.
                 task = prior.sample(seed=_SETUP_BASE_SEED + i)
@@ -120,22 +94,8 @@ class BarDistributionHead:
                 ycol = X[:, -1]
                 pooled.append(ycol[np.isfinite(ycol)])
 
-        ally = (
-            np.concatenate([p for p in pooled if p.size])
-            if pooled
-            else np.zeros(1, np.float32)
-        )
+        ally = np.concatenate([p for p in pooled if p.size]) if pooled else np.zeros(1, np.float32)
         ally = ally[np.isfinite(ally)]
-        print(
-            "[bar_distribution_head] setup pooled outcomes "
-            f"tasks={_SETUP_TASKS} "
-            f"points_per_task={_SETUP_POINTS} "
-            f"finite_values={int(ally.size)} "
-            f"min={float(ally.min()) if ally.size else None} "
-            f"max={float(ally.max()) if ally.size else None} "
-            f"std={float(ally.std()) if ally.size else None}",
-            flush=True,
-        )
         if ally.size < self.num_buckets + 1:
             # Degenerate prior draw — keep the linspace placeholder.
             return
@@ -154,115 +114,32 @@ class BarDistributionHead:
         if device is not None:
             borders_t = borders_t.to(device)
         self.proj.bar_borders.copy_(borders_t)
-        print(
-            "[bar_distribution_head] setup borders "
-            f"num_buckets={self.num_buckets} "
-            f"border_min={float(borders_t.min().item())} "
-            f"border_max={float(borders_t.max().item())} "
-            f"min_width={float((borders_t[1:] - borders_t[:-1]).min().item())} "
-            f"max_width={float((borders_t[1:] - borders_t[:-1]).max().item())}",
-            flush=True,
-        )
-
-    @staticmethod
-    def _halfnormal_with_p_weight_before(range_max: Any, p: float = 0.5) -> Any:
-        import torch
-
-        p_t = torch.tensor(p, device=range_max.device, dtype=range_max.dtype)
-        one = torch.tensor(1.0, device=range_max.device, dtype=range_max.dtype)
-        unit = torch.distributions.HalfNormal(one)
-        scale = range_max / unit.icdf(p_t).clamp_min(1e-8)
-        return torch.distributions.HalfNormal(scale.clamp_min(1e-8))
 
     # ── generic custom-loss hook (bucketized NLL) ──────────────────────────
     def loss(self, logits: Any, target: Any) -> Any:
         import torch
-        import torch.nn.functional as F  # noqa: N812
+        import torch.nn.functional as F
 
-        borders = self.proj.bar_borders.to(device=logits.device, dtype=logits.dtype)
+        borders = self.proj.bar_borders
         nb = borders.numel() - 1
+        target = target.reshape(-1).to(logits.dtype)
 
-        logits = logits.reshape(-1, nb)
-        target = target.reshape(-1).to(device=logits.device, dtype=logits.dtype)
+        # Bucket index containing each target, clamped to the valid range so
+        # targets beyond the outer borders land in the edge buckets.
+        idx = torch.bucketize(target, borders, right=False) - 1
+        idx = idx.clamp(0, nb - 1)
 
-        if not torch.isfinite(borders).all():
-            print(
-                "[bar_distribution_head] non-finite bucket borders "
-                f"borders={_bar_tensor_stats('borders', borders)}",
-                flush=True,
-            )
-            raise RuntimeError("BAR head has non-finite bucket borders.")
-
-        widths = borders[1:] - borders[:-1]
-        if not torch.isfinite(widths).all() or (widths <= 0).any():
-            print(
-                "[bar_distribution_head] invalid bucket widths "
-                f"borders={_bar_tensor_stats('borders', borders)} "
-                f"widths={_bar_tensor_stats('widths', widths)}",
-                flush=True,
-            )
-            raise RuntimeError("BAR head has invalid bucket widths.")
-
-        finite_target = torch.isfinite(target)
-        finite_logits = torch.isfinite(logits).all(dim=-1)
-        valid = finite_target & finite_logits
-
-        if valid.sum() == 0:
-            print(
-                "[bar_distribution_head] no valid target/logit rows "
-                f"target={_bar_tensor_stats('target', target)} "
-                f"logits={_bar_tensor_stats('logits', logits)} "
-                f"borders={_bar_tensor_stats('borders', borders)} "
-                f"widths={_bar_tensor_stats('widths', widths)}",
-                flush=True,
-            )
-            raise RuntimeError("BAR head got no finite target/logit rows.")
-
-        if (~finite_logits & finite_target).any():
-            print(
-                "[bar_distribution_head] dropping non-finite logit rows "
-                f"finite_targets={int(finite_target.sum().item())} "
-                f"finite_logits={int(finite_logits.sum().item())} "
-                f"valid={int(valid.sum().item())} "
-                f"target={_bar_tensor_stats('target', target)} "
-                f"logits={_bar_tensor_stats('logits', logits)}",
-                flush=True,
-            )
-
-        logits = logits[valid].clamp(-60.0, 60.0)
-        target = target[valid]
-
-        # Stable BAR training path:
-        # map each continuous target to one bucket, then use cross entropy.
-        # This avoids fragile density/tail math that can create NaN gradients.
-        target = target.clamp(
-            min=borders[0].detach(),
-            max=borders[-1].detach(),
-        )
-
-        bucket_idx = torch.bucketize(target, borders, right=False) - 1
-        bucket_idx = bucket_idx.clamp(0, nb - 1).long()
-
-        loss = F.cross_entropy(logits, bucket_idx)
-
-        if not torch.isfinite(loss):
-            print(
-                "[bar_distribution_head] non-finite CE loss "
-                f"loss={float(loss.detach().item()) if loss.numel() else None} "
-                f"target={_bar_tensor_stats('target', target)} "
-                f"logits={_bar_tensor_stats('logits', logits)} "
-                f"bucket_idx={_bar_tensor_stats('bucket_idx', bucket_idx.float())} "
-                f"borders={_bar_tensor_stats('borders', borders)} "
-                f"widths={_bar_tensor_stats('widths', widths)}",
-                flush=True,
-            )
-            raise RuntimeError("BAR head produced non-finite cross-entropy loss.")
-
-        return loss
+        logp = F.log_softmax(logits, dim=-1)  # (n_qry, nb)
+        widths = (borders[1:] - borders[:-1]).clamp_min(1e-6)  # (nb,)
+        chosen = logp.gather(-1, idx.unsqueeze(-1)).squeeze(-1)  # (n_qry,)
+        # Continuous NLL: −log( p_bucket / bucket_width ) — density, not mass,
+        # so the head is penalized for spreading probability over wide buckets.
+        nll = -(chosen - torch.log(widths[idx]))
+        return nll.mean()
 
     # ── generic prediction-reduction hook (distribution mean) ──────────────
     def to_prediction(self, output: Any) -> Any:
-        import torch.nn.functional as F  # noqa: N812
+        import torch.nn.functional as F
 
         borders = self.proj.bar_borders
         centers = 0.5 * (borders[1:] + borders[:-1])  # (nb,)

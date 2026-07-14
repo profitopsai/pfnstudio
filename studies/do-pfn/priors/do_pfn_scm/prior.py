@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-import random
-from collections.abc import Callable
-from typing import Any
+from typing import Any, Callable
 
-import networkx as nx
+import random
 import numpy as np
+import networkx as nx
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from pfnstudio_core import Prior, register_prior
 
 
@@ -32,14 +32,12 @@ def activation_sampling(nonlins: str):
 def make_exo_dist_samples(shape: tuple[int, ...], exo_std: float):
     def sample():
         return torch.normal(0, exo_std, shape)
-
     return sample
 
 
 def make_additive_noise_gaussian(shape: tuple[int, ...], std: float):
     def sample():
         return torch.normal(0, std, shape)
-
     return sample
 
 
@@ -91,9 +89,7 @@ class StructuralCausalModel:
         self.endogenous_vars[name] = None
         self.functions[name] = (function, param_varnames)
 
-    def add_exogenous_var(
-        self, name: str, distribution: Callable, distribution_kwargs: dict
-    ):
+    def add_exogenous_var(self, name: str, distribution: Callable, distribution_kwargs: dict):
         name = name.upper()
         self.exogenous_vars[name] = None
         self.exogenous_distributions[name] = (distribution, distribution_kwargs)
@@ -152,9 +148,7 @@ class StructuralCausalModel:
 
         if binarize and self.t_key in self.exogenous_vars and exogenous_vars is None:
             self.set_binarization_params(self.exogenous_vars[self.t_key])
-            self.exogenous_vars[self.t_key] = self.get_binarized_treatment(
-                self.exogenous_vars[self.t_key]
-            )
+            self.exogenous_vars[self.t_key] = self.get_binarized_treatment(self.exogenous_vars[self.t_key])
 
         structure = graph if graph is not None else self.create_graph()
         for node in nx.topological_sort(structure):
@@ -167,9 +161,7 @@ class StructuralCausalModel:
 
             if binarize and self.t_key == node:
                 self.set_binarization_params(self.endogenous_vars[node])
-                self.endogenous_vars[node] = self.get_binarized_treatment(
-                    self.endogenous_vars[node]
-                )
+                self.endogenous_vars[node] = self.get_binarized_treatment(self.endogenous_vars[node])
 
         return dict(self.endogenous_vars), dict(self.exogenous_vars)
 
@@ -215,9 +207,7 @@ class SCMGenerator:
                     graph.add_edge(perm[i], perm[j])
         return graph
 
-    def create_scm_from_graph(
-        self, graph, possible_functions, exo_distribution, exo_distribution_kwargs
-    ):
+    def create_scm_from_graph(self, graph, possible_functions, exo_distribution, exo_distribution_kwargs):
         scm = StructuralCausalModel()
 
         mapping = {}
@@ -281,65 +271,7 @@ def _adjacency_from_graph(graph, k: int):
 # consistent, but it is a controlled-direct-effect flavour of CATE, not the
 # total effect. The paper's structured case studies separate these; v0.1 does
 # not. See README "What this study does *not* show (yet)".
-_ORACLE_CLAMP: float = 1.0e4
-_STABLE_SAMPLE_ABS_MAX: float = 1.0e4
-
-
-_PRIOR_WARN_ABS_MAX: float = 1.0e4
-_PRIOR_ACCEPT_LOG_EVERY: int = 5000
-
-
-def _np_stats(name: str, arr):
-    a = np.asarray(arr)
-    finite = np.isfinite(a)
-    out = {
-        "name": name,
-        "shape": tuple(a.shape),
-        "finite": int(finite.sum()),
-        "nan": int(np.isnan(a).sum()),
-        "inf": int(np.isinf(a).sum()),
-    }
-    if finite.any():
-        vals = a[finite]
-        out["min"] = float(vals.min())
-        out["max"] = float(vals.max())
-        out["max_abs"] = float(np.abs(vals).max())
-    return out
-
-
-def _should_log_prior_accept(seed: int, stats: list[dict]) -> bool:
-    if int(seed) % _PRIOR_ACCEPT_LOG_EVERY == 0:
-        return True
-
-    for s in stats:
-        # X is allowed to contain NaNs because query y is masked in X.
-        if s.get("name") != "X" and s.get("nan", 0):
-            return True
-
-        # Inf is never expected.
-        if s.get("inf", 0):
-            return True
-
-        # Very large finite values are suspicious.
-        if s.get("max_abs", 0.0) > _PRIOR_WARN_ABS_MAX:
-            return True
-
-    return False
-
-
-def _assert_stable_torch_sample(name: str, tensor: torch.Tensor) -> None:
-    if tensor.numel() == 0:
-        raise FloatingPointError(f"{name} is empty")
-
-    if not torch.isfinite(tensor).all():
-        bad = int((~torch.isfinite(tensor)).sum().item())
-        raise FloatingPointError(f"{name} has {bad} NaN/Inf values")
-
-    max_abs = float(tensor.detach().abs().max().cpu().item())
-    if max_abs > _STABLE_SAMPLE_ABS_MAX:
-        raise FloatingPointError(
-            f"{name} is unstable: max_abs={max_abs:.4g} > {_STABLE_SAMPLE_ABS_MAX:.4g}"
-        )
+_ORACLE_CLAMP: float = 1.0e6
 
 
 def _apply_nonlinearity(z, gamma_idx: int):
@@ -392,9 +324,7 @@ def _extract_equations(scm, graph, k: int):
     return eqs
 
 
-def _build_oracle_noise(
-    n: int, k: int, equations, sigma_exo: float, sigma_eps: float, rng
-):
+def _build_oracle_noise(n: int, k: int, equations, sigma_exo: float, sigma_eps: float, rng):
     """Root (exogenous) nodes ~ N(0, sigma_exo); non-roots ~ N(0, sigma_eps) —
     matching the torch prior's exogenous vs additive-noise split."""
     eps = np.empty((n, k), dtype=np.float64)
@@ -462,12 +392,8 @@ def monte_carlo_oracle_cate(
     acc_zero = np.zeros(n, dtype=np.float64)
     for _ in range(int(n_mc)):
         eps = _build_oracle_noise(n, k, equations, sigma_exo, sigma_eps, rng)
-        acc_one += _oracle_forward(
-            equations, topo_order, eps, {**base, int(t_idx): one_lvl}
-        )[:, y_idx]
-        acc_zero += _oracle_forward(
-            equations, topo_order, eps, {**base, int(t_idx): zero_lvl}
-        )[:, y_idx]
+        acc_one += _oracle_forward(equations, topo_order, eps, {**base, int(t_idx): one_lvl})[:, y_idx]
+        acc_zero += _oracle_forward(equations, topo_order, eps, {**base, int(t_idx): zero_lvl})[:, y_idx]
     return ((acc_one - acc_zero) / int(n_mc)).astype(np.float32)
 
 
@@ -554,10 +480,7 @@ def sample_do_pfn_torch_batch(
     scm.undo_interventions()
 
     x_candidates = list(set(graph.nodes) - {scm.t_key, scm.y_key})
-    x_keys = [
-        scm.t_key,
-        *np.random.choice(x_candidates, size=num_features, replace=False),
-    ]
+    x_keys = [scm.t_key] + list(np.random.choice(x_candidates, size=num_features, replace=False))
 
     x_obs = torch.stack([sample_obs[key] for key in x_keys]).permute(-1, 1, 0)
     x_int = torch.stack([sample_int[key] for key in x_keys]).permute(-1, 1, 0)
@@ -567,10 +490,9 @@ def sample_do_pfn_torch_batch(
     y_obs = sample_obs[scm.y_key].T.unsqueeze(-1)
     y_int = sample_int[scm.y_key].T.unsqueeze(-1)
 
-    _assert_stable_torch_sample("x_obs", x_obs)
-    _assert_stable_torch_sample("x_int", x_int)
-    _assert_stable_torch_sample("y_obs", y_obs)
-    _assert_stable_torch_sample("y_int", y_int)
+    for tensor in (x_obs, x_int, y_obs, y_int):
+        if torch.any(torch.isnan(tensor)) or torch.any(torch.isinf(tensor)):
+            raise FloatingPointError("non-finite sample")
 
     adj = _adjacency_from_graph(graph, k)
     cov_indices = [_idx(key) for key in x_keys[1:]]
@@ -622,7 +544,7 @@ def sample_do_pfn_studio_task(
     num_features: int = 6,
     num_unobserved: int = 1,
     K_max: int = 10,
-    max_retries: int = 50,
+    max_retries: int = 5,
     oracle_mc: int = 0,
     **params: Any,
 ):
@@ -644,13 +566,6 @@ def sample_do_pfn_studio_task(
             break
         except Exception as exc:
             last_exc = exc
-            print(
-                f"[do_pfn_scm] rejected sampled SCM "
-                f"seed={seed + attempt * 1_000_003} "
-                f"attempt={attempt + 1}/{max_retries} "
-                f"reason={type(exc).__name__}: {exc}",
-                flush=True,
-            )
     else:
         raise RuntimeError(f"Do-PFN sampling failed: {last_exc}") from last_exc
 
@@ -696,22 +611,17 @@ def sample_do_pfn_studio_task(
             n_mc=int(oracle_mc),
             rng=o_rng,
         )
-        meta["cate_true_source"] = (
-            f"monte_carlo_oracle_do1_minus_do0(n_mc={int(oracle_mc)})"
-        )
+        meta["cate_true_source"] = f"monte_carlo_oracle_do1_minus_do0(n_mc={int(oracle_mc)})"
     else:
         # Cheap fallback used at train time (the trainer never reads cate_true):
         # a single-draw interventional-minus-observational contrast. This is
         # NOT the CATE — request oracle_mc>0 (the eval does) for a real CATE.
         cate_true = (
-            (batch.target_y[:, 0, 0] - batch.y[:, 0, 0])
-            .cpu()
-            .numpy()
-            .astype(np.float32)
+            (batch.target_y[:, 0, 0] - batch.y[:, 0, 0]).cpu().numpy().astype(np.float32)
         )[:num_samples]
         meta["cate_true_source"] = "single_draw_interventional_minus_observational"
 
-    out = {
+    return {
         "X": x_with_y,
         "y": y_full[n_ctx:].astype(np.float32),
         "n_ctx": n_ctx,
@@ -719,31 +629,6 @@ def sample_do_pfn_studio_task(
         "adjacency": batch.adjacency.astype(np.int8),
         "task_meta": meta,
     }
-
-    stats = [
-        _np_stats("X", out["X"]),
-        _np_stats("y", out["y"]),
-        _np_stats("cate_true", out["cate_true"]),
-    ]
-
-    if _should_log_prior_accept(seed, stats):
-        print(
-            "[do_pfn_scm] accepted sampled SCM "
-            f"seed={seed} "
-            f"K={meta.get('K')} "
-            f"num_features={meta.get('num_features')} "
-            f"p_edge={meta.get('p_edge'):.6g} "
-            f"edge_density={meta.get('edge_density'):.6g} "
-            f"n_ctx={n_ctx} "
-            f"sigma_exo={meta.get('sigma_exo'):.6g} "
-            f"sigma_eps={meta.get('sigma_eps'):.6g} "
-            f"t_idx={meta.get('t_idx')} "
-            f"y_idx={meta.get('y_idx')} "
-            f"stats={stats}",
-            flush=True,
-        )
-
-    return out
 
 
 @register_prior("do_pfn_scm")
@@ -757,7 +642,7 @@ class DoPfnSCMPrior(Prior):
         num_features: int = 6,
         num_unobserved: int = 1,
         K_max: int = 10,
-        max_retries: int = 50,
+        max_retries: int = 5,
         oracle_mc: int = 0,
         noise_dist: str = "gaussian",
         exo_dist: str = "gaussian",

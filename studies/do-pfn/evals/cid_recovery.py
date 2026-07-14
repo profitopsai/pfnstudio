@@ -92,10 +92,8 @@ class DoPfnCidRecoveryScorer(DatasetScorer):
             import torch
         except ImportError as e:
             return ScorerResult(
-                metrics={},
-                meta={"dependency_missing": str(e)},
-                skipped=True,
-                skip_reason=f"missing dependency: {e}",
+                metrics={}, meta={"dependency_missing": str(e)},
+                skipped=True, skip_reason=f"missing dependency: {e}",
             )
 
         from pfnstudio_core.registry import get_prior
@@ -105,8 +103,7 @@ class DoPfnCidRecoveryScorer(DatasetScorer):
             prior_cls = get_prior(run_spec.prior.id)
         except KeyError:
             return ScorerResult(
-                metrics={},
-                meta={"prior_id": run_spec.prior.id},
+                metrics={}, meta={"prior_id": run_spec.prior.id},
                 skipped=True,
                 skip_reason=f"prior '{run_spec.prior.id}' not registered in this project",
             )
@@ -187,14 +184,14 @@ class DoPfnCidRecoveryScorer(DatasetScorer):
             covered = (y_true >= lo) & (y_true <= hi)
             return int(covered.sum()), int(covered.shape[0])
 
-        sse_cid = 0.0  # predicted Y_int vs oracle Y_int
+        sse_cid = 0.0          # predicted Y_int vs oracle Y_int
         n_cid = 0
-        nmse_cid_sum = 0.0  # per-task range-normalized CID MSE
-        nmse_cid_tasks = 0  # tasks with a non-degenerate CID range
-        nmse_cate_sum = 0.0  # per-task range-normalized CATE MSE
-        nmse_cate_tasks = 0  # tasks with a non-degenerate CATE range
-        sse_cate_pfn = 0.0  # (pred1-pred0) vs cate_true
-        sse_cate_naive = 0.0  # T-learner ridge vs cate_true
+        nmse_cid_sum = 0.0     # per-task range-normalized CID MSE
+        nmse_cid_tasks = 0     # tasks with a non-degenerate CID range
+        nmse_cate_sum = 0.0    # per-task range-normalized CATE MSE
+        nmse_cate_tasks = 0    # tasks with a non-degenerate CATE range
+        sse_cate_pfn = 0.0     # (pred1-pred0) vs cate_true
+        sse_cate_naive = 0.0   # T-learner ridge vs cate_true
         n_cate = 0
         naive_rows = 0
         sum_cate_pfn = 0.0
@@ -212,8 +209,7 @@ class DoPfnCidRecoveryScorer(DatasetScorer):
             cate_true = task.get("cate_true")
             if seq is None or y_q is None or n_ctx is None or cate_true is None:
                 return ScorerResult(
-                    metrics={},
-                    meta={"prior_keys": sorted(task.keys())},
+                    metrics={}, meta={"prior_keys": sorted(task.keys())},
                     skipped=True,
                     skip_reason=(
                         "Prior didn't emit the Do-PFN shape (need X, y, n_ctx, cate_true)."
@@ -226,10 +222,8 @@ class DoPfnCidRecoveryScorer(DatasetScorer):
             d = width - 2  # [t, x_1..x_d, y]
             if seq.ndim != 2 or d < 1:
                 return ScorerResult(
-                    metrics={},
-                    meta={"token_width": int(width)},
-                    skipped=True,
-                    skip_reason="Token width < 3 — not the Do-PFN packing.",
+                    metrics={}, meta={"token_width": int(width)},
+                    skipped=True, skip_reason="Token width < 3 — not the Do-PFN packing.",
                 )
 
             y_q = np.asarray(y_q, dtype=np.float64)
@@ -253,14 +247,12 @@ class DoPfnCidRecoveryScorer(DatasetScorer):
             # squared error by the target's range² so tasks are comparable.
             rng_y = float(np.max(y_q) - np.min(y_q))
             if rng_y > _EPS:
-                nmse_cid_sum += float(se_cid / y_q.shape[0]) / (rng_y**2)
+                nmse_cid_sum += float(se_cid / y_q.shape[0]) / (rng_y ** 2)
                 nmse_cid_tasks += 1
 
             # CATE: same context, force every query treatment to 0 then 1.
-            seq0 = seq.copy()
-            seq0[n_ctx:, 0] = 0.0
-            seq1 = seq.copy()
-            seq1[n_ctx:, 0] = 1.0
+            seq0 = seq.copy(); seq0[n_ctx:, 0] = 0.0
+            seq1 = seq.copy(); seq1[n_ctx:, 0] = 1.0
             cate_pfn = run_model(seq1, n_ctx) - run_model(seq0, n_ctx)
             se_cate = np.sum((cate_pfn - cate_q) ** 2)
             sse_cate_pfn += float(se_cate)
@@ -270,7 +262,7 @@ class DoPfnCidRecoveryScorer(DatasetScorer):
 
             rng_c = float(np.max(cate_q) - np.min(cate_q))
             if rng_c > _EPS:
-                nmse_cate_sum += float(se_cate / cate_q.shape[0]) / (rng_c**2)
+                nmse_cate_sum += float(se_cate / cate_q.shape[0]) / (rng_c ** 2)
                 nmse_cate_tasks += 1
 
             # Naive T-learner ridge on the OBSERVED (confounded) context.
@@ -289,9 +281,7 @@ class DoPfnCidRecoveryScorer(DatasetScorer):
 
         if n_cate == 0:
             return ScorerResult(
-                metrics={},
-                meta={},
-                skipped=True,
+                metrics={}, meta={}, skipped=True,
                 skip_reason="No query positions scored.",
             )
 
@@ -301,9 +291,7 @@ class DoPfnCidRecoveryScorer(DatasetScorer):
         oracle_cate_mse = 0.0  # oracle predicts its own cate_true → floor is 0
         ate_error = abs(sum_cate_pfn / n_cate - sum_cate_true / n_cate)
         cid_nmse = (nmse_cid_sum / nmse_cid_tasks) if nmse_cid_tasks else float("nan")
-        cate_nmse = (
-            (nmse_cate_sum / nmse_cate_tasks) if nmse_cate_tasks else float("nan")
-        )
+        cate_nmse = (nmse_cate_sum / nmse_cate_tasks) if nmse_cate_tasks else float("nan")
         picp_90 = (picp_hit / picp_n) if picp_n else float("nan")
         picp_90_gap = abs(picp_90 - PICP_MASS) if picp_n else float("nan")
 
@@ -315,9 +303,7 @@ class DoPfnCidRecoveryScorer(DatasetScorer):
             "naive_cate_mse": naive_cate_mse,
             "oracle_cate_mse": oracle_cate_mse,
             # >1 means the model's CATE beats the confounded observational ridge.
-            "ratio_vs_naive_cate": (
-                (naive_cate_mse / cate_mse) if cate_mse > _EPS else float("inf")
-            ),
+            "ratio_vs_naive_cate": (naive_cate_mse / cate_mse) if cate_mse > _EPS else float("inf"),
             # Absolute CATE MSE against the MC oracle (0 = perfect recovery).
             "ratio_vs_oracle_cate": cate_mse,
             "ate_error": ate_error,
