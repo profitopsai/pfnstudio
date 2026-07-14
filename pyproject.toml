@@ -22,7 +22,6 @@ ignore = [
 # how every PyTorch codebase imports it.
 "priors/**/*.py" = ["N803", "N806", "RUF012"]
 "studies/**/*.py" = ["N803", "N806", "RUF012"]
-"templates/**/*.py" = ["N803", "N806", "RUF012"]
 "starters/**/*.py" = ["N803", "N806", "RUF012"]
 "tests/**/*.py" = ["N803", "N806", "RUF012", "E402"]
 "examples/**/*.py" = ["N803", "N806"]
