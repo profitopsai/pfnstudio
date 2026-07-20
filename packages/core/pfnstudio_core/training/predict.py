@@ -690,9 +690,7 @@ def _dispatch_inference(
 
         with torch.no_grad():
             inp = torch.from_numpy(seq).float().unsqueeze(0)  # (1, N, F+2)
-            out = _forward_full_sequence(
-                model, inp, tag_tensor=tag_tensor, single_eval_pos=n_ctx
-            )
+            out = _forward_full_sequence(model, inp, tag_tensor=tag_tensor, single_eval_pos=n_ctx)
             if out is None:
                 raise ValueError(
                     "Model has no head producing a scalar logit per token — expected a scalar_head."
@@ -734,9 +732,7 @@ def _dispatch_inference(
 
         with torch.no_grad():
             inp = torch.from_numpy(seq).float().unsqueeze(0)  # (1, N, F+2)
-            out = _forward_full_sequence(
-                model, inp, tag_tensor=tag_tensor, single_eval_pos=n_ctx
-            )
+            out = _forward_full_sequence(model, inp, tag_tensor=tag_tensor, single_eval_pos=n_ctx)
             if out is None:
                 raise ValueError(
                     "Model has no head producing scalar predictions — expected a scalar_head."

@@ -176,10 +176,7 @@ def _case_forward(
         parent_matrix = np.column_stack([values[parent] for parent in parents])
         linear = parent_matrix @ mechanism["weights"]
         with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-            generated = (
-                _paper_case_activation(mechanism["activation"], linear, np)
-                + noise[node]
-            )
+            generated = _paper_case_activation(mechanism["activation"], linear, np) + noise[node]
 
         # Released Do-PFN binarizes a generated treatment at its batch mean.
         # Root treatment in Observed Mediator is already Bernoulli.
@@ -201,12 +198,8 @@ def _generate_structured_case_task(
         sigma_eps = float(0.3 * rng.beta(1.0, 5.0))
         mechanisms = _sample_case_mechanisms(spec, rng, np)
 
-        context_noise = _sample_case_noise(
-            spec, CASE_CONTEXT_ROWS, sigma_exo, sigma_eps, rng
-        )
-        query_noise = _sample_case_noise(
-            spec, CASE_QUERY_ROWS, sigma_exo, sigma_eps, rng
-        )
+        context_noise = _sample_case_noise(spec, CASE_CONTEXT_ROWS, sigma_exo, sigma_eps, rng)
+        query_noise = _sample_case_noise(spec, CASE_QUERY_ROWS, sigma_exo, sigma_eps, rng)
         context = _case_forward(spec, mechanisms, context_noise, np)
 
         treatment_query = rng.integers(0, 2, size=CASE_QUERY_ROWS).astype(np.float64)
@@ -300,9 +293,7 @@ def _log(level: str, message: str, **fields: Any) -> None:
 class DoPfnCidRecoveryScorer(DatasetScorer):
     """Measure interventional-outcome and CATE recovery."""
 
-    def score(
-        self, *, model: Any, eval_spec: Any, loader: Any, run_spec: Any
-    ) -> ScorerResult:
+    def score(self, *, model: Any, eval_spec: Any, loader: Any, run_spec: Any) -> ScorerResult:
         try:
             import numpy as np
             import torch
@@ -346,9 +337,7 @@ class DoPfnCidRecoveryScorer(DatasetScorer):
                 return [block]
             found: list[Any] = []
             for value in vars(block).values():
-                if isinstance(value, nn.Module) and all(
-                    value is not old for old in found
-                ):
+                if isinstance(value, nn.Module) and all(value is not old for old in found):
                     found.append(value)
             return found
 
@@ -363,17 +352,13 @@ class DoPfnCidRecoveryScorer(DatasetScorer):
                 parameter = next(submodule.parameters(), None)
                 if parameter is not None:
                     model_device = parameter.device
-                    device_source = (
-                        f"{type(block).__name__}.{type(submodule).__name__}.parameter"
-                    )
+                    device_source = f"{type(block).__name__}.{type(submodule).__name__}.parameter"
                     located = True
                     break
                 buffer = next(submodule.buffers(), None)
                 if buffer is not None:
                     model_device = buffer.device
-                    device_source = (
-                        f"{type(block).__name__}.{type(submodule).__name__}.buffer"
-                    )
+                    device_source = f"{type(block).__name__}.{type(submodule).__name__}.buffer"
                     located = True
                     break
             if located:
@@ -451,9 +436,7 @@ class DoPfnCidRecoveryScorer(DatasetScorer):
         def locate_y_column(sequence: Any, n_ctx: int) -> int:
             context = sequence[:n_ctx]
             query = sequence[n_ctx:]
-            candidates = np.isfinite(context).any(axis=0) & (~np.isfinite(query)).all(
-                axis=0
-            )
+            candidates = np.isfinite(context).any(axis=0) & (~np.isfinite(query)).all(axis=0)
             indices = np.flatnonzero(candidates)
             if indices.size != 1:
                 raise ValueError(
@@ -514,9 +497,9 @@ class DoPfnCidRecoveryScorer(DatasetScorer):
             high_index = (cumulative >= 1.0 - tail).argmax(axis=1)
             last = bar_borders.shape[0] - 1
             low = bar_borders[low_index] * float(target_std) + float(target_mean)
-            high = bar_borders[np.minimum(high_index + 1, last)] * float(
-                target_std
-            ) + float(target_mean)
+            high = bar_borders[np.minimum(high_index + 1, last)] * float(target_std) + float(
+                target_mean
+            )
             covered = (y_true >= low) & (y_true <= high)
             return int(covered.sum()), int(covered.shape[0])
 
@@ -550,12 +533,7 @@ class DoPfnCidRecoveryScorer(DatasetScorer):
             y_query = task.get("y")
             n_ctx = task.get("n_ctx")
             cate_true = task.get("cate_true")
-            if (
-                sequence is None
-                or y_query is None
-                or n_ctx is None
-                or cate_true is None
-            ):
+            if sequence is None or y_query is None or n_ctx is None or cate_true is None:
                 return ScorerResult(
                     metrics={},
                     meta={"prior_keys": sorted(task.keys())},
@@ -589,16 +567,12 @@ class DoPfnCidRecoveryScorer(DatasetScorer):
             target_mean = float(task_meta.get("target_mean", 0.0))
             target_std = float(task_meta.get("target_std", 1.0))
             y_query_model = np.asarray(y_query, dtype=np.float64).reshape(-1)
-            y_query = np.asarray(
-                task.get("y_raw", y_query_model), dtype=np.float64
-            ).reshape(-1)
+            y_query = np.asarray(task.get("y_raw", y_query_model), dtype=np.float64).reshape(-1)
             cate_model_all = np.asarray(cate_true, dtype=np.float64).reshape(-1)
             cate_all = np.asarray(
                 task.get("cate_true_raw", cate_model_all), dtype=np.float64
             ).reshape(-1)
-            cate_query = (
-                cate_all[n_ctx:] if cate_all.shape[0] == sequence.shape[0] else cate_all
-            )
+            cate_query = cate_all[n_ctx:] if cate_all.shape[0] == sequence.shape[0] else cate_all
             n_query = sequence.shape[0] - n_ctx
             if y_query.shape[0] != n_query or cate_query.shape[0] != n_query:
                 raise ValueError(
@@ -652,19 +626,10 @@ class DoPfnCidRecoveryScorer(DatasetScorer):
             treated = treatment_context > 0.5
             untreated = ~treated
             required_rows = num_covariate_columns + 1
-            if (
-                int(treated.sum()) >= required_rows
-                and int(untreated.sum()) >= required_rows
-            ):
-                weights1 = _ridge_fit(
-                    x_context[treated], y_context[treated], RIDGE_LAMBDA, np
-                )
-                weights0 = _ridge_fit(
-                    x_context[untreated], y_context[untreated], RIDGE_LAMBDA, np
-                )
-                cate_naive = _ridge_pred(weights1, x_query, np) - _ridge_pred(
-                    weights0, x_query, np
-                )
+            if int(treated.sum()) >= required_rows and int(untreated.sum()) >= required_rows:
+                weights1 = _ridge_fit(x_context[treated], y_context[treated], RIDGE_LAMBDA, np)
+                weights0 = _ridge_fit(x_context[untreated], y_context[untreated], RIDGE_LAMBDA, np)
+                cate_naive = _ridge_pred(weights1, x_query, np) - _ridge_pred(weights0, x_query, np)
                 sse_cate_naive += float(np.sum((cate_naive - cate_query) ** 2))
                 naive_rows += n_query
 
@@ -729,9 +694,7 @@ class DoPfnCidRecoveryScorer(DatasetScorer):
             "nmse_cate_tasks": nmse_cate_tasks,
             "cate_method": "paired do(0)/do(1) query treatment intervention",
             "ratio_vs_naive_cate_note": "PFN CATE MSE / naive CATE MSE; below 1 is better",
-            "cate_true": (
-                "Monte-Carlo oracle E[Y|do(1),X]-E[Y|do(0),X] " f"(n_mc={ORACLE_MC})"
-            ),
+            "cate_true": (f"Monte-Carlo oracle E[Y|do(1),X]-E[Y|do(0),X] (n_mc={ORACLE_MC})"),
             "target_transform": (
                 "context Y standardization with sample std + 1e-6 and "
                 "[-100,100] clipping; predictions converted back to raw units"
@@ -785,18 +748,14 @@ class DoPfnCidRecoveryScorer(DatasetScorer):
                 n_query_case = int(y_query.shape[0])
 
                 y_column_case = locate_y_column(sequence, n_ctx_case)
-                sequence_model, target_mean_case, target_std_case = (
-                    normalize_sequence_target(
-                        sequence,
-                        n_ctx_case,
-                        y_column_case,
-                    )
+                sequence_model, target_mean_case, target_std_case = normalize_sequence_target(
+                    sequence,
+                    n_ctx_case,
+                    y_column_case,
                 )
 
                 raw_case = run_head_raw(sequence_model, n_ctx_case)
-                prediction_case = (
-                    to_scalar(raw_case) * target_std_case + target_mean_case
-                )
+                prediction_case = to_scalar(raw_case) * target_std_case + target_mean_case
                 cid_error = float(np.sum((prediction_case - y_query) ** 2))
 
                 sequence_do0 = sequence_model.copy()
@@ -804,8 +763,7 @@ class DoPfnCidRecoveryScorer(DatasetScorer):
                 sequence_do0[n_ctx_case:, 0] = 0.0
                 sequence_do1[n_ctx_case:, 0] = 1.0
                 cate_prediction = (
-                    run_model(sequence_do1, n_ctx_case)
-                    - run_model(sequence_do0, n_ctx_case)
+                    run_model(sequence_do1, n_ctx_case) - run_model(sequence_do0, n_ctx_case)
                 ) * target_std_case
                 cate_error = float(np.sum((cate_prediction - cate_query) ** 2))
 
@@ -839,22 +797,15 @@ class DoPfnCidRecoveryScorer(DatasetScorer):
             case_cid_mse = case_cid_sse / max(case_rows, 1)
             case_cate_mse = case_cate_sse / max(case_rows, 1)
             case_cid_nmse = (
-                case_cid_nmse_sum / case_cid_nmse_tasks
-                if case_cid_nmse_tasks
-                else float("nan")
+                case_cid_nmse_sum / case_cid_nmse_tasks if case_cid_nmse_tasks else float("nan")
             )
             case_cate_nmse = (
-                case_cate_nmse_sum / case_cate_nmse_tasks
-                if case_cate_nmse_tasks
-                else float("nan")
+                case_cate_nmse_sum / case_cate_nmse_tasks if case_cate_nmse_tasks else float("nan")
             )
             case_ate_error = abs(
-                case_cate_pred_sum / max(case_rows, 1)
-                - case_cate_true_sum / max(case_rows, 1)
+                case_cate_pred_sum / max(case_rows, 1) - case_cate_true_sum / max(case_rows, 1)
             )
-            case_picp_90 = (
-                case_picp_hits / case_picp_rows if case_picp_rows else float("nan")
-            )
+            case_picp_90 = case_picp_hits / case_picp_rows if case_picp_rows else float("nan")
 
             prefix = f"case_{case_slug}"
             metrics.update(
@@ -908,11 +859,9 @@ class DoPfnCidRecoveryScorer(DatasetScorer):
         metrics.update(
             {
                 "case6_cid_mse": structured_cid_sse / max(structured_rows, 1),
-                "case6_cid_nmse": structured_cid_nmse_sum
-                / max(structured_cid_nmse_tasks, 1),
+                "case6_cid_nmse": structured_cid_nmse_sum / max(structured_cid_nmse_tasks, 1),
                 "case6_cate_mse": structured_cate_sse / max(structured_rows, 1),
-                "case6_cate_nmse": structured_cate_nmse_sum
-                / max(structured_cate_nmse_tasks, 1),
+                "case6_cate_nmse": structured_cate_nmse_sum / max(structured_cate_nmse_tasks, 1),
                 "case6_ate_error": abs(
                     structured_cate_pred_sum / max(structured_rows, 1)
                     - structured_cate_true_sum / max(structured_rows, 1)
@@ -929,9 +878,7 @@ class DoPfnCidRecoveryScorer(DatasetScorer):
                 "structured_case_tasks_per_study": CASE_TASKS_PER_STUDY,
                 "structured_case_context_rows": CASE_CONTEXT_ROWS,
                 "structured_case_query_rows": CASE_QUERY_ROWS,
-                "structured_case_total_tasks": (
-                    len(CASE_STUDIES) * CASE_TASKS_PER_STUDY
-                ),
+                "structured_case_total_tasks": (len(CASE_STUDIES) * CASE_TASKS_PER_STUDY),
                 "structured_case_total_rows": structured_rows,
                 "structured_case_generator_retries": structured_retries,
                 "structured_case_nonlinearities": [

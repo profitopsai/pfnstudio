@@ -36,6 +36,7 @@ Output variables, M = 4 * n_queries * n_lambda:
     n_ctx      scalar                      = N                     [context_length -> n_ctx]
     gamma / bound_type / query_id / source_row_index   (M,1) diagnostics, not trained on
 """
+
 import math
 
 import networkx as nx
@@ -48,12 +49,14 @@ import torch.nn.functional as F  # noqa: N812
 try:
     from pfnstudio_core import Prior, register_prior
 except Exception:
+
     class Prior:
         pass
 
     def register_prior(name):
         def deco(cls):
             return cls
+
         return deco
 
 
@@ -61,10 +64,17 @@ except Exception:
 # Flow config + small numerics (ported from the authors' frontier.py)
 # =============================================================================
 
+
 class FlowConfig:
     # author-exact: 16 bins (via _sample_impl), tail bound 6.0, min bin 1e-3 (Table 2)
-    def __init__(self, num_bins=8, tail_bound=6.0,
-                 min_bin_width=1e-3, min_bin_height=1e-3, min_derivative=1e-3):
+    def __init__(
+        self,
+        num_bins=8,
+        tail_bound=6.0,
+        min_bin_width=1e-3,
+        min_bin_height=1e-3,
+        min_derivative=1e-3,
+    ):
         self.num_bins = num_bins
         self.tail_bound = tail_bound
         self.min_bin_width = min_bin_width
@@ -87,8 +97,8 @@ def batched_spline_forward(base_u, spline_params, cfg):
     nb = cfg.num_bins
     base_u = base_u.contiguous()
     widths = spline_params[..., :nb]
-    heights = spline_params[..., nb:2 * nb]
-    derivatives = spline_params[..., 2 * nb:]
+    heights = spline_params[..., nb : 2 * nb]
+    derivatives = spline_params[..., 2 * nb :]
 
     widths = F.softmax(widths, dim=-1)
     widths = cfg.min_bin_width + (1.0 - cfg.min_bin_width * nb) * widths
@@ -129,8 +139,9 @@ def batched_spline_forward(base_u, spline_params, cfg):
     den = in_d + (in_der + in_der1 - 2.0 * in_d) * t1mt
     u_inside = in_ch + num / den
 
-    der_num = in_d.pow(2) * (in_der1 * theta.pow(2) + 2.0 * in_d * t1mt
-                             + in_der * (1.0 - theta).pow(2))
+    der_num = in_d.pow(2) * (
+        in_der1 * theta.pow(2) + 2.0 * in_d * t1mt + in_der * (1.0 - theta).pow(2)
+    )
     logabsdet_inside = torch.log(der_num) - 2.0 * torch.log(den)
 
     u = torch.where(inside, u_inside, base_u)
@@ -142,6 +153,7 @@ def batched_spline_forward(base_u, spline_params, cfg):
 # =============================================================================
 # Random MLPs (the structural functions f_A, f_BNN)
 # =============================================================================
+
 
 def _random_mlp(in_dim, out_dim, n_layers, hidden, weight_std, device):
     sizes = [in_dim] + [hidden] * (n_layers - 2) + [out_dim]
@@ -166,13 +178,18 @@ def _mlp(x, layers):
 # 1. Generate one SCM / DGP   (covariate DAG + f_A + f_BNN)
 # =============================================================================
 
+
 class DAGStructuredSCM:
     """Authors' covariate generator, vendored VERBATIM from gen_standard_syn.py."""
 
-    def __init__(self, prior_layers=lambda: np.random.randint(2, 6),
-                 prior_hidden_size=lambda: np.random.randint(10, 50),
-                 prior_weight=lambda: np.random.normal(0, 1),
-                 edge_drop_prob=0.4, activation=lambda x: np.tanh(x)):
+    def __init__(
+        self,
+        prior_layers=lambda: np.random.randint(2, 6),
+        prior_hidden_size=lambda: np.random.randint(10, 50),
+        prior_weight=lambda: np.random.normal(0, 1),
+        edge_drop_prob=0.4,
+        activation=lambda x: np.tanh(x),
+    ):
         self.prior_layers = prior_layers
         self.prior_hidden_size = prior_hidden_size
         self.prior_weight = prior_weight
@@ -278,26 +295,33 @@ def _generate_dgp(N, D, device="cpu"):
         edge_drop_prob=0.5,
         activation=lambda x: np.tanh(x),
     )
-    X_np = dag_scm.generate_dataset(num_features=D, num_samples=N)        # (N, D) numpy
+    X_np = dag_scm.generate_dataset(num_features=D, num_samples=N)  # (N, D) numpy
     X = torch.as_tensor(X_np, dtype=torch.float32, device=device)
-    X = (X - X.mean(0)) / (X.std(0) + 1e-6)              # standardize (authors normalize per-feature)
+    X = (X - X.mean(0)) / (X.std(0) + 1e-6)  # standardize (authors normalize per-feature)
 
     # --- treatment f_A: propensity -> Bernoulli (raw sigmoid, no clamp — authors') ---
-    f_a = _random_mlp(D, 1, np.random.randint(3, 5), np.random.randint(8, 20),
-                      weight_std=0.8, device=device)
-    pi_obs = torch.sigmoid(_mlp(X, f_a))                 # (N,1)
+    f_a = _random_mlp(
+        D, 1, np.random.randint(3, 5), np.random.randint(8, 20), weight_std=0.8, device=device
+    )
+    pi_obs = torch.sigmoid(_mlp(X, f_a))  # (N,1)
     A = torch.bernoulli(pi_obs)
 
     # --- outcome f_BNN([X, A, U]); normalize Y by potential-outcome (y0,y1) stats ---
-    f_y = _random_mlp(D + 1 + 1, 1, np.random.randint(3, 6), np.random.randint(10, 25),
-                      weight_std=1.0, device=device)
+    f_y = _random_mlp(
+        D + 1 + 1,
+        1,
+        np.random.randint(3, 6),
+        np.random.randint(10, 25),
+        weight_std=1.0,
+        device=device,
+    )
     U = torch.randn(N, 1, device=device)
     zeros = torch.zeros(N, 1, device=device)
     ones = torch.ones(N, 1, device=device)
-    y0 = _mlp(torch.cat([X, zeros, U], dim=1), f_y)      # potential outcome a=0
-    y1 = _mlp(torch.cat([X, ones, U], dim=1), f_y)       # potential outcome a=1
+    y0 = _mlp(torch.cat([X, zeros, U], dim=1), f_y)  # potential outcome a=0
+    y1 = _mlp(torch.cat([X, ones, U], dim=1), f_y)  # potential outcome a=1
     Y_obs = torch.where(A > 0.5, y1, y0)
-    y_all = torch.cat([y0, y1], dim=0)                   # authors normalize over [y0,y1]
+    y_all = torch.cat([y0, y1], dim=0)  # authors normalize over [y0,y1]
     y_mean, y_std = y_all.mean(), y_all.std() + 1e-6
     Y = (Y_obs - y_mean) / y_std
 
@@ -308,6 +332,7 @@ def _generate_dgp(N, D, device="cpu"):
 # 2. Frontier: spline flow over U, MSM divergence, Lagrangian sweep
 # =============================================================================
 
+
 def _f_bnn_on_u(x, a, u, f_y, y_norm):
     """f_BNN at each (B,G) for U-samples u.  x (B,G,D) a (B,G,1) u (B,G,S) -> (B,G,S)."""
     B, G, D = x.shape
@@ -315,21 +340,21 @@ def _f_bnn_on_u(x, a, u, f_y, y_norm):
     x_exp = x.unsqueeze(2).expand(B, G, S, D)
     a_exp = a.unsqueeze(2).expand(B, G, S, 1)
     u_exp = u.unsqueeze(-1)
-    raw = _mlp(torch.cat([x_exp, a_exp, u_exp], dim=-1), f_y).squeeze(-1)   # (B,G,S)
+    raw = _mlp(torch.cat([x_exp, a_exp, u_exp], dim=-1), f_y).squeeze(-1)  # (B,G,S)
     y_mean, y_std = y_norm
     return (raw - y_mean) / y_std
 
 
 def _theta_gamma(sp, base_u, phi_u, x, a, pi, f_y, y_norm, cfg):
     """One forward pass over (B,G): spline flow -> mixture -> theta, and MSM gamma."""
-    nu, log_p = batched_spline_forward(base_u, sp, cfg)          # (B,G,S)
+    nu, log_p = batched_spline_forward(base_u, sp, cfg)  # (B,G,S)
     log_r = log_p - standard_normal_logprob(nu)
-    r = torch.exp(log_r)                                         # authors: no clamp (flow keeps r bounded)
+    r = torch.exp(log_r)  # authors: no clamp (flow keeps r bounded)
     gamma = torch.maximum(r.amax(dim=-1), 1.0 / r.amin(dim=-1))  # (B,G)  MSM divergence
-    xi = torch.bernoulli(pi.unsqueeze(-1).expand_as(nu))         # (B,G,S)
+    xi = torch.bernoulli(pi.unsqueeze(-1).expand_as(nu))  # (B,G,S)
     u_query = xi * phi_u + (1.0 - xi) * nu
-    y = _f_bnn_on_u(x, a, u_query, f_y, y_norm)                  # (B,G,S)
-    theta = y.mean(dim=-1)                                       # (B,G)
+    y = _f_bnn_on_u(x, a, u_query, f_y, y_norm)  # (B,G,S)
+    theta = y.mean(dim=-1)  # (B,G)
     return theta, gamma
 
 
@@ -337,8 +362,17 @@ class SolverConfig:
     """Authors' SolverConfig, author-exact numerics (Table 2):
     350 optimizer steps per lambda (base), k_train=128, k_eval=4096, sqrt-lr and
     inverse-sqrt-step lambda schedules with their reference/cap values."""
-    def __init__(self, lr=1e-3, lr_lambda_ref=0.25, lr_lambda_min_mult=0.40,
-                 max_steps=350, max_steps_max_mult=2.0, mc_train=128, mc_eval=4096):
+
+    def __init__(
+        self,
+        lr=1e-3,
+        lr_lambda_ref=0.25,
+        lr_lambda_min_mult=0.40,
+        max_steps=350,
+        max_steps_max_mult=2.0,
+        mc_train=128,
+        mc_eval=4096,
+    ):
         self.lr = lr
         self.lr_lambda_ref = lr_lambda_ref
         self.lr_lambda_min_mult = lr_lambda_min_mult
@@ -384,58 +418,61 @@ def _solve_bound(sign, x_q, a_q, pi_q, f_y, y_norm, lambdas, cfg, scfg, device):
     pi = pi_q.view(1, G)
 
     sp = torch.zeros(1, G, d_sp, device=device)
-    sp[..., 2 * nb:] = der_init                          # identity-ish start
+    sp[..., 2 * nb :] = der_init  # identity-ish start
 
     gammas, thetas = [], []
-    for lam in lambdas:                                  # descending -> warm start
+    for lam in lambdas:  # descending -> warm start
         lr_mult = _lr_mult_for_lambda(lam, scfg)
         eff_lr = scfg.lr * lr_mult
         eff_steps = _max_steps_for_lambda(lam, scfg, lr_mult)
-        sp_p = nn.Parameter(sp.clone())                  # start from previous solution
-        opt = torch.optim.Adam([sp_p], lr=eff_lr)        # fresh momentum per lambda
+        sp_p = nn.Parameter(sp.clone())  # start from previous solution
+        opt = torch.optim.Adam([sp_p], lr=eff_lr)  # fresh momentum per lambda
         for _ in range(eff_steps):
             opt.zero_grad()
             base_u = torch.randn(1, G, scfg.mc_train, device=device)
             phi_u = torch.randn(1, G, scfg.mc_train, device=device)
             theta, gamma = _theta_gamma(sp_p, base_u, phi_u, x, a, pi, f_y, y_norm, cfg)
             obj = sign * theta - float(lam) * gamma
-            (-obj.mean()).backward()      # authors reduce by MEAN over queries (per_dgp_sum / batch_mean)
+            (
+                -obj.mean()
+            ).backward()  # authors reduce by MEAN over queries (per_dgp_sum / batch_mean)
             _clip_spline_grad_per_query(sp_p, 1.0)
             opt.step()
-        sp = sp_p.detach()                               # carry forward = warm start
+        sp = sp_p.detach()  # carry forward = warm start
         with torch.no_grad():
             base_u = torch.randn(1, G, scfg.mc_eval, device=device)
             phi_u = torch.randn(1, G, scfg.mc_eval, device=device)
             theta, gamma = _theta_gamma(sp, base_u, phi_u, x, a, pi, f_y, y_norm, cfg)
-        gammas.append(gamma.squeeze(0))                  # (G,)
+        gammas.append(gamma.squeeze(0))  # (G,)
         thetas.append(theta.squeeze(0))
-    return torch.stack(gammas, 0), torch.stack(thetas, 0)   # (L,G)
+    return torch.stack(gammas, 0), torch.stack(thetas, 0)  # (L,G)
 
 
 # =============================================================================
 # 3. One training item  (Studio entry point)
 # =============================================================================
 
+
 def _sample_impl(N=1024, D=10, n_queries=32, n_lambda=5, seed=None, num_bins=16):
     if seed is not None:
         np.random.seed(int(seed) % (2**31 - 1))
         torch.manual_seed(int(seed))
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    cfg = FlowConfig(num_bins=num_bins)      # author-exact: 16 bins, tail 6.0
-    scfg = SolverConfig()                    # author-exact: 350 steps, MC 128/4096
+    cfg = FlowConfig(num_bins=num_bins)  # author-exact: 16 bins, tail 6.0
+    scfg = SolverConfig()  # author-exact: 350 steps, MC 128/4096
 
     # (1) fake world
     X, A, Y, pi_obs, f_y, y_norm = _generate_dgp(N, D, device=device)
 
     # (2) query groups = n_queries patients x both arms
     src = np.random.choice(N, size=n_queries, replace=(n_queries > N))
-    src_g = np.repeat(src, 2)                                   # each patient twice
-    arm_g = np.tile([0, 1], n_queries).astype(np.float32)      # arm 0 and arm 1
+    src_g = np.repeat(src, 2)  # each patient twice
+    arm_g = np.tile([0, 1], n_queries).astype(np.float32)  # arm 0 and arm 1
     G = 2 * n_queries
     src_t = torch.as_tensor(src_g, device=device)
-    x_q = X.index_select(0, src_t)                             # (G,D)
-    a_q = torch.as_tensor(arm_g, device=device).view(G, 1)     # (G,1)
-    pi_src = pi_obs.index_select(0, src_t)                     # P(A=1|x)
+    x_q = X.index_select(0, src_t)  # (G,D)
+    a_q = torch.as_tensor(arm_g, device=device).view(G, 1)  # (G,1)
+    pi_src = pi_obs.index_select(0, src_t)  # P(A=1|x)
     pi_q = torch.where(a_q > 0.5, pi_src, 1.0 - pi_src).view(G)  # P(arm|x)
 
     # (3) bounds: descending lambda sweep, warm-started (50-point grid over [0.08, 2.0])
@@ -458,12 +495,13 @@ def _sample_impl(N=1024, D=10, n_queries=32, n_lambda=5, seed=None, num_bins=16)
             gv, tv = g[order, grp], t[order, grp]
             tv = np.maximum.accumulate(tv) if bound_val == 0 else np.minimum.accumulate(tv)
             for k in range(L):
-                rows.append((grp, int(src_g[grp]), float(arm_g[grp]),
-                             float(gv[k]), float(tv[k]), bound_val))
+                rows.append(
+                    (grp, int(src_g[grp]), float(arm_g[grp]), float(gv[k]), float(tv[k]), bound_val)
+                )
 
     add_bound(g_up, t_up, 0)
     add_bound(g_lo, t_lo, 1)
-    rows.sort(key=lambda r: (r[0], r[5]))                      # group rows by query_id
+    rows.sort(key=lambda r: (r[0], r[5]))  # group rows by query_id
 
     # (5) PACK into one sequence: context rows on top, query rows below.
     #     token = (x_1..x_D, a, y_or_0, gamma_or_0, bound_flag, is_context)  width = D + 5
@@ -479,17 +517,17 @@ def _sample_impl(N=1024, D=10, n_queries=32, n_lambda=5, seed=None, num_bins=16)
     ctx[:, :D] = X_np
     ctx[:, D] = A_np
     ctx[:, Y_COL] = Y_np
-    ctx[:, ISCTX_COL] = 1.0            # gamma=0, bound=0 (masked); is_context=1
+    ctx[:, ISCTX_COL] = 1.0  # gamma=0, bound=0 (masked); is_context=1
 
     qry = np.zeros((M, W), dtype=np.float32)
     for j, (_qid, src, arm, gam, _th, bnd) in enumerate(rows):
         qry[j, :D] = X_np[src]
         qry[j, D] = arm
         qry[j, GAMMA_COL] = gam
-        qry[j, BOUND_COL] = float(bnd)   # y=0 (masked); is_context=0
+        qry[j, BOUND_COL] = float(bnd)  # y=0 (masked); is_context=0
 
-    X_packed = np.concatenate([ctx, qry], axis=0).astype(np.float32)     # (N+M, D+5)
-    theta_star = np.array([[r[4]] for r in rows], dtype=np.float32)      # (M, 1) target
+    X_packed = np.concatenate([ctx, qry], axis=0).astype(np.float32)  # (N+M, D+5)
+    theta_star = np.array([[r[4]] for r in rows], dtype=np.float32)  # (M, 1) target
 
     # diagnostics (not trained on; used by the bounds eval / calibration)
     gamma = np.array([[r[3]] for r in rows], dtype=np.float32)
@@ -498,12 +536,12 @@ def _sample_impl(N=1024, D=10, n_queries=32, n_lambda=5, seed=None, num_bins=16)
     source_row_index = np.array([[r[1]] for r in rows], dtype=np.float32)
 
     return {
-        "X":                X_packed,         # (N+M, D+4)  packed context+query
-        "theta_star":       theta_star,       # (M, 1)      bound label   [role target -> y]
-        "n_ctx":            np.int64(N),       # scalar     boundary       [role context_length -> n_ctx]
-        "gamma":            gamma,
-        "bound_type":       bound_type,
-        "query_id":         query_id,
+        "X": X_packed,  # (N+M, D+4)  packed context+query
+        "theta_star": theta_star,  # (M, 1)      bound label   [role target -> y]
+        "n_ctx": np.int64(N),  # scalar     boundary       [role context_length -> n_ctx]
+        "gamma": gamma,
+        "bound_type": bound_type,
+        "query_id": query_id,
         "source_row_index": source_row_index,
     }
 
@@ -532,8 +570,9 @@ class CausalSensitivityPackedPrior(Prior):
 
 if __name__ == "__main__":
     import time
+
     t0 = time.time()
-    out = sample(N=256, D=10, n_queries=8, n_lambda=8, seed=0)   # sanity-size self-test
+    out = sample(N=256, D=10, n_queries=8, n_lambda=8, seed=0)  # sanity-size self-test
     print(f"sample() took {time.time() - t0:.2f}s")
     for k, v in out.items():
         print(f"  {k:18s} {getattr(v, 'shape', '()')}  {v.dtype}")

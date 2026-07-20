@@ -44,6 +44,7 @@ from __future__ import annotations
 # functions raise clearly on first use without torch.
 try:
     import torch
+
     _Tensor = torch.Tensor
     _Module = torch.nn.Module
 except ImportError:  # pragma: no cover — torch is a hard requirement here
@@ -80,8 +81,7 @@ def extract_nan_indicator(x):
     """
     if torch is None:  # pragma: no cover
         raise ImportError(
-            "extract_nan_indicator requires torch. "
-            "Install with: pip install pfnstudio-core[torch]"
+            "extract_nan_indicator requires torch. Install with: pip install pfnstudio-core[torch]"
         )
     indicator = torch.zeros_like(x)
     indicator[torch.isnan(x)] = NAN_INDICATOR
@@ -109,13 +109,9 @@ def mean_impute(x, n_train: int):
     if torch is None:  # pragma: no cover
         raise ImportError("mean_impute requires torch.")
     if x.dim() != 3:
-        raise ValueError(
-            f"mean_impute expects 3-D input (B, R, C); got shape {tuple(x.shape)}."
-        )
+        raise ValueError(f"mean_impute expects 3-D input (B, R, C); got shape {tuple(x.shape)}.")
     if not (0 < n_train <= x.shape[1]):
-        raise ValueError(
-            f"n_train must be in (0, R={x.shape[1]}]; got {n_train}."
-        )
+        raise ValueError(f"n_train must be in (0, R={x.shape[1]}]; got {n_train}.")
 
     # Compute per-feature means from the train rows, ignoring non-finite
     # cells. We replace non-finite cells with zero, sum, and divide by
@@ -153,13 +149,9 @@ def standard_scale(x, n_train: int):
     if torch is None:  # pragma: no cover
         raise ImportError("standard_scale requires torch.")
     if x.dim() != 3:
-        raise ValueError(
-            f"standard_scale expects 3-D input (B, R, C); got shape {tuple(x.shape)}."
-        )
+        raise ValueError(f"standard_scale expects 3-D input (B, R, C); got shape {tuple(x.shape)}.")
     if not (0 < n_train <= x.shape[1]):
-        raise ValueError(
-            f"n_train must be in (0, R={x.shape[1]}]; got {n_train}."
-        )
+        raise ValueError(f"n_train must be in (0, R={x.shape[1]}]; got {n_train}.")
 
     train_x = x[:, :n_train]
     mean = train_x.mean(dim=1)  # (B, C)
@@ -196,7 +188,7 @@ class TabularPreprocessor:
 
     def __init__(self):
         self.feature_means = None  # (B, C) — set by fit_transform
-        self.scaler_stats = None   # {"mean", "std"} — set by fit_transform
+        self.scaler_stats = None  # {"mean", "std"} — set by fit_transform
         self._fitted = False
 
     def fit_transform(self, x, n_train: int):
@@ -216,9 +208,7 @@ class TabularPreprocessor:
         if torch is None:  # pragma: no cover
             raise ImportError("TabularPreprocessor requires torch.")
         if x.dim() != 3:
-            raise ValueError(
-                f"fit_transform expects 3-D input (B, R, C); got {tuple(x.shape)}."
-            )
+            raise ValueError(f"fit_transform expects 3-D input (B, R, C); got {tuple(x.shape)}.")
 
         # 1. Extract NaN/Inf indicators BEFORE any cell is replaced.
         indicator = extract_nan_indicator(x)
@@ -254,17 +244,14 @@ class TabularPreprocessor:
                 "has no fitted stats to apply."
             )
         if x_test.dim() != 3:
-            raise ValueError(
-                f"transform_test_only expects 3-D input; got {tuple(x_test.shape)}."
-            )
+            raise ValueError(f"transform_test_only expects 3-D input; got {tuple(x_test.shape)}.")
 
         indicator = extract_nan_indicator(x_test)
         # Use cached train-row means for imputation.
         means_broadcast = self.feature_means.unsqueeze(1).expand_as(x_test)
         cleaned = torch.where(torch.isfinite(x_test), x_test, means_broadcast)
         # Use cached train-row stats for scaling.
-        scaled = (
-            (cleaned - self.scaler_stats["mean"].unsqueeze(1))
-            / self.scaler_stats["std"].unsqueeze(1)
-        )
+        scaled = (cleaned - self.scaler_stats["mean"].unsqueeze(1)) / self.scaler_stats[
+            "std"
+        ].unsqueeze(1)
         return torch.stack([scaled, indicator], dim=-1)

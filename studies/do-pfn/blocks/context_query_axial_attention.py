@@ -50,15 +50,11 @@ class DoPFNAxialAttentionBlock:
         if self.d_model <= 0:
             raise ValueError(f"d_model must be positive; got {self.d_model}.")
         if self.n_heads <= 0 or self.d_model % self.n_heads != 0:
-            raise ValueError(
-                f"n_heads={self.n_heads} must divide d_model={self.d_model}."
-            )
+            raise ValueError(f"n_heads={self.n_heads} must divide d_model={self.d_model}.")
         if self.ff_mult <= 0:
             raise ValueError(f"ff_mult must be positive; got {self.ff_mult}.")
         if self.layer_norm_eps <= 0.0:
-            raise ValueError(
-                f"layer_norm_eps must be positive; got {self.layer_norm_eps}."
-            )
+            raise ValueError(f"layer_norm_eps must be positive; got {self.layer_norm_eps}.")
 
         # These are standard MultiheadAttention modules, as used by the
         # released PerFeatureEncoderLayer. bias=False comes from its checkpoint
@@ -126,24 +122,19 @@ class DoPFNAxialAttentionBlock:
 
         if not torch.is_tensor(x):
             raise TypeError(
-                "dopfn_axial_attention_block expects a torch.Tensor; "
-                f"got {type(x).__name__}."
+                f"dopfn_axial_attention_block expects a torch.Tensor; got {type(x).__name__}."
             )
         if x.dim() != 4:
             raise ValueError(
-                "dopfn_axial_attention_block expects shape "
-                f"(B, R, C, E); got {tuple(x.shape)}."
+                f"dopfn_axial_attention_block expects shape (B, R, C, E); got {tuple(x.shape)}."
             )
 
         batch_size, rows, feature_tokens, embedding = (int(value) for value in x.shape)
         if embedding != self.d_model:
-            raise ValueError(
-                f"Expected d_model={self.d_model}; got final dimension " f"{embedding}."
-            )
+            raise ValueError(f"Expected d_model={self.d_model}; got final dimension {embedding}.")
         if single_eval_pos is None:
             raise ValueError(
-                "dopfn_axial_attention_block requires single_eval_pos from "
-                "the prior's n_ctx value."
+                "dopfn_axial_attention_block requires single_eval_pos from the prior's n_ctx value."
             )
         n_ctx = int(single_eval_pos)
         if not 0 < n_ctx <= rows:
@@ -176,9 +167,7 @@ class DoPFNAxialAttentionBlock:
         # Context rows attend to context rows. Query rows use all six matching
         # context K/V heads and cannot see themselves or other query rows.
         item_input = (
-            x.transpose(1, 2)
-            .contiguous()
-            .reshape(batch_size * feature_tokens, rows, self.d_model)
+            x.transpose(1, 2).contiguous().reshape(batch_size * feature_tokens, rows, self.d_model)
         )
         context = item_input[:, :n_ctx]
         context_output, _ = self.item_attention(

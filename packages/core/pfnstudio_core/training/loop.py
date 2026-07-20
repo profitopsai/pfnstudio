@@ -82,9 +82,8 @@ def _is_head_module(mod: Any) -> bool:
     head assembled wrong (the head ran on the pre-pool encoder output,
     surfacing as tensor-size mismatches).
     """
-    return (
-        type(mod).__name__ in {"DiscoveryHead", "EstimationHead", "ScalarHead"}
-        or bool(getattr(mod, "is_head", False))
+    return type(mod).__name__ in {"DiscoveryHead", "EstimationHead", "ScalarHead"} or bool(
+        getattr(mod, "is_head", False)
     )
 
 
@@ -276,7 +275,7 @@ def _default_step(model: Any, batch: list[dict], hp: dict) -> Any:
     # the targets, flattened across the batch (the head reshapes rows
     # internally). Duck-typed + OPTIONAL: heads without it fall through to MSE.
     nq = int(n_ctx) if n_ctx is not None else 0
-    for head, ho in zip(heads, head_outputs):
+    for head, ho in zip(heads, head_outputs, strict=False):
         _loss = getattr(head, "loss", None)
         if callable(_loss):
             q = ho[:, nq:, :]  # (B, n_qry, out_dim)

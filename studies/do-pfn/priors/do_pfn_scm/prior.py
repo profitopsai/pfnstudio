@@ -104,7 +104,9 @@ def activation_sampling(nonlins: str):
             weights /= weights.sum()
 
         def apply(x):
-            out = sum(float(weight) * fn(x) for weight, (_, fn) in zip(weights, chosen, strict=False))
+            out = sum(
+                float(weight) * fn(x) for weight, (_, fn) in zip(weights, chosen, strict=False)
+            )
             return torch.clamp(out, -1000.0, 1000.0)
 
         return _tag_activation(
@@ -234,9 +236,7 @@ class StructuralCausalModel:
         self.endogenous_vars[name] = None
         self.functions[name] = (function, param_varnames)
 
-    def add_exogenous_var(
-        self, name: str, distribution: Callable, distribution_kwargs: dict
-    ):
+    def add_exogenous_var(self, name: str, distribution: Callable, distribution_kwargs: dict):
         name = name.upper()
         self.exogenous_vars[name] = None
         self.exogenous_distributions[name] = (distribution, distribution_kwargs)
@@ -647,9 +647,7 @@ def _extract_equations(scm, graph, k: int):
     return eqs
 
 
-def _build_oracle_noise(
-    n: int, k: int, equations, sigma_exo: float, sigma_eps: float, rng
-):
+def _build_oracle_noise(n: int, k: int, equations, sigma_exo: float, sigma_eps: float, rng):
     """Root (exogenous) nodes ~ N(0, sigma_exo); non-roots ~ N(0, sigma_eps) --
     matching the torch prior's exogenous vs additive-noise split."""
     eps = np.empty((n, k), dtype=np.float64)
@@ -674,13 +672,9 @@ def _oracle_forward(equations, topo_order, eps, overrides):
         else:
             linear = endo[:, parents] @ eq["weights"]
             if eq.get("post"):
-                endo[:, node] = _apply_nonlinearity(
-                    linear + eps[:, node], eq["activation_spec"]
-                )
+                endo[:, node] = _apply_nonlinearity(linear + eps[:, node], eq["activation_spec"])
             else:
-                endo[:, node] = (
-                    _apply_nonlinearity(linear, eq["activation_spec"]) + eps[:, node]
-                )
+                endo[:, node] = _apply_nonlinearity(linear, eq["activation_spec"]) + eps[:, node]
     return endo
 
 
@@ -714,8 +708,7 @@ def monte_carlo_oracle_cate(
     """
     n = observed_values.shape[0]
     base = {
-        int(node): observed_values[:, i].astype(np.float64)
-        for i, node in enumerate(cov_indices)
+        int(node): observed_values[:, i].astype(np.float64) for i, node in enumerate(cov_indices)
     }
     one_lvl = np.full(n, float(t_level_for_one), dtype=np.float64)
     zero_lvl = np.full(n, float(t_level_for_zero), dtype=np.float64)
@@ -723,12 +716,12 @@ def monte_carlo_oracle_cate(
     acc_zero = np.zeros(n, dtype=np.float64)
     for _ in range(int(n_mc)):
         eps = _build_oracle_noise(n, k, equations, sigma_exo, sigma_eps, rng)
-        acc_one += _oracle_forward(
-            equations, topo_order, eps, {**base, int(t_idx): one_lvl}
-        )[:, y_idx]
-        acc_zero += _oracle_forward(
-            equations, topo_order, eps, {**base, int(t_idx): zero_lvl}
-        )[:, y_idx]
+        acc_one += _oracle_forward(equations, topo_order, eps, {**base, int(t_idx): one_lvl})[
+            :, y_idx
+        ]
+        acc_zero += _oracle_forward(equations, topo_order, eps, {**base, int(t_idx): zero_lvl})[
+            :, y_idx
+        ]
     return ((acc_one - acc_zero) / int(n_mc)).astype(np.float32)
 
 
@@ -760,9 +753,7 @@ def sample_do_pfn_torch_batch(
     torch.manual_seed(seed)
 
     if invalid_policy not in {"retry", "sentinel"}:
-        raise ValueError(
-            "invalid_policy must be 'retry' or 'sentinel', " f"got {invalid_policy!r}"
-        )
+        raise ValueError(f"invalid_policy must be 'retry' or 'sentinel', got {invalid_policy!r}")
     if exo_dist != "gaussian":
         raise ValueError("Do-PFN v1 training prior uses gaussian exogenous noise.")
 
@@ -868,8 +859,7 @@ def sample_do_pfn_torch_batch(
                 _assert_finite_torch_sample(name, value)
         else:
             raise ValueError(
-                "invalid_policy must be 'retry' or 'sentinel', "
-                f"got {invalid_policy!r}"
+                f"invalid_policy must be 'retry' or 'sentinel', got {invalid_policy!r}"
             )
 
     adj = _adjacency_from_graph(graph, k)
@@ -991,24 +981,17 @@ def _format_do_pfn_studio_task(
             n_mc=int(oracle_mc),
             rng=o_rng,
         )
-        meta["cate_true_source"] = (
-            f"monte_carlo_oracle_do1_minus_do0(n_mc={int(oracle_mc)})"
-        )
+        meta["cate_true_source"] = f"monte_carlo_oracle_do1_minus_do0(n_mc={int(oracle_mc)})"
     else:
         cate_true_raw = (
-            (batch.target_y[:, b, 0] - batch.y[:, b, 0])
-            .cpu()
-            .numpy()
-            .astype(np.float32)
+            (batch.target_y[:, b, 0] - batch.y[:, b, 0]).cpu().numpy().astype(np.float32)
         )
         meta["cate_true_source"] = "single_draw_interventional_minus_observational"
 
     # An affine Y transform cancels the mean in a treatment contrast.  Keep
     # both scales: normalized values are consumed by the model-facing scorer,
     # while raw values let evaluation report effects in the original units.
-    cate_true = (
-        np.asarray(cate_true_raw, dtype=np.float64) / float(target_std)
-    ).astype(np.float32)
+    cate_true = (np.asarray(cate_true_raw, dtype=np.float64) / float(target_std)).astype(np.float32)
 
     out = {
         "X": x_with_y,
@@ -1047,9 +1030,7 @@ def _format_do_pfn_studio_task(
             action="evaluation_should_skip_this_task",
         )
     if _should_log_prior_accept(seed, [*stats, *raw_stats]):
-        has_large_values = any(
-            stat.get("max_abs", 0.0) > _PRIOR_WARN_ABS_MAX for stat in raw_stats
-        )
+        has_large_values = any(stat.get("max_abs", 0.0) > _PRIOR_WARN_ABS_MAX for stat in raw_stats)
         _log_prior_event(
             "warning" if has_large_values else "info",
             "accepted_task_large_values" if has_large_values else "accepted_task",
@@ -1294,8 +1275,7 @@ class DoPfnSCMPrior(Prior):
             upper = min(int(num_unobserved_max), max_allowed)
             if upper < int(num_unobserved_min):
                 raise ValueError(
-                    f"No valid num_unobserved for num_features={num_features}, "
-                    f"K_max={K_max}"
+                    f"No valid num_unobserved for num_features={num_features}, K_max={K_max}"
                 )
             num_unobserved = int(rng.integers(num_unobserved_min, upper + 1))
 

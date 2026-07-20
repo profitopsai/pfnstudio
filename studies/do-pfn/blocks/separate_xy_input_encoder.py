@@ -82,10 +82,7 @@ class DoPFNInputEncoder:
         if self.d_model <= 0:
             raise ValueError(f"d_model must be positive; got {self.d_model}.")
         if self.features_per_group <= 0:
-            raise ValueError(
-                "features_per_group must be positive; "
-                f"got {self.features_per_group}."
-            )
+            raise ValueError(f"features_per_group must be positive; got {self.features_per_group}.")
         if self.clip_value <= 0.0:
             raise ValueError(f"clip_value must be positive; got {self.clip_value}.")
         if self.eps <= 0.0:
@@ -143,9 +140,7 @@ class DoPFNInputEncoder:
             )
         n_ctx = int(single_eval_pos)
         if not 0 < n_ctx < rows:
-            raise ValueError(
-                f"single_eval_pos must be in [1, R-1]; got {n_ctx} for R={rows}."
-            )
+            raise ValueError(f"single_eval_pos must be in [1, R-1]; got {n_ctx} for R={rows}.")
         if not x.is_floating_point():
             x = x.float()
 
@@ -157,8 +152,7 @@ class DoPFNInputEncoder:
         y_col = self._locate_y_column(x, n_ctx)
         if y_col <= 0:
             raise ValueError(
-                f"Detected Y at column {y_col}; at least one treatment/X "
-                "column must precede it."
+                f"Detected Y at column {y_col}; at least one treatment/X column must precede it."
             )
         x_raw = x[:, :, :y_col]
         y_raw = x[:, :, y_col : y_col + 1]
@@ -266,9 +260,7 @@ class DoPFNInputEncoder:
                 x_all_missing_context_features=int(x_all_missing.sum().item()),
                 y_all_missing_context_features=int(y_all_missing.sum().item()),
                 standardized_values_clipped=x_clip_count,
-                max_abs_standardized_before_clip=self._finite_abs_max(
-                    x_scaled_unclipped
-                ),
+                max_abs_standardized_before_clip=self._finite_abs_max(x_scaled_unclipped),
                 max_abs_encoder_output=self._finite_abs_max(out),
             )
 
@@ -281,9 +273,7 @@ class DoPFNInputEncoder:
         query = value[:, n_ctx:, :]
 
         # Y has observed context values and is masked for all query rows.
-        candidates = torch.isfinite(context).any(dim=1) & (~torch.isfinite(query)).all(
-            dim=1
-        )
+        candidates = torch.isfinite(context).any(dim=1) & (~torch.isfinite(query)).all(dim=1)
         counts = candidates.sum(dim=1)
         if not (counts == 1).all():
             self._log(
@@ -348,9 +338,7 @@ class DoPFNInputEncoder:
         safe = torch.where(finite, context, torch.zeros_like(context))
         means = safe.sum(dim=1) / counts.clamp(min=1).to(value.dtype)
         means = torch.where(all_missing, torch.zeros_like(means), means)
-        cleaned = torch.where(
-            torch.isfinite(value), value, means.unsqueeze(1).expand_as(value)
-        )
+        cleaned = torch.where(torch.isfinite(value), value, means.unsqueeze(1).expand_as(value))
         return cleaned, all_missing
 
     def _normalize_x(self, value: Any, n_ctx: int) -> Any:

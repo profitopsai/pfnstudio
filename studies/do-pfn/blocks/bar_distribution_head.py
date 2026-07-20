@@ -218,9 +218,7 @@ class BarDistributionHead:
         import torch.nn.functional as functional
 
         if logits.shape[-1] != self.num_buckets:
-            raise ValueError(
-                f"Expected {self.num_buckets} logits; got {logits.shape[-1]}."
-            )
+            raise ValueError(f"Expected {self.num_buckets} logits; got {logits.shape[-1]}.")
         if not torch.isfinite(logits).all():
             self._log("error", "non_finite_logits_in_loss", **self._stats(logits))
             raise FloatingPointError("BAR loss received NaN/Inf logits.")
@@ -242,8 +240,7 @@ class BarDistributionHead:
         ).reshape(-1)
         if flat_logits.shape[0] != flat_target.shape[0]:
             raise ValueError(
-                "BAR logits/target row mismatch: "
-                f"{flat_logits.shape[0]} vs {flat_target.shape[0]}."
+                f"BAR logits/target row mismatch: {flat_logits.shape[0]} vs {flat_target.shape[0]}."
             )
 
         valid = torch.isfinite(flat_target)
@@ -271,16 +268,12 @@ class BarDistributionHead:
         if left_mask.any():
             left_distance = (borders[1] - y[left_mask]).clamp_min(1.0e-8)
             log_density[left_mask] = (
-                log_density[left_mask]
-                + left_tail.log_prob(left_distance)
-                + widths[0].log()
+                log_density[left_mask] + left_tail.log_prob(left_distance) + widths[0].log()
             )
         if right_mask.any():
             right_distance = (y[right_mask] - borders[-2]).clamp_min(1.0e-8)
             log_density[right_mask] = (
-                log_density[right_mask]
-                + right_tail.log_prob(right_distance)
-                + widths[-1].log()
+                log_density[right_mask] + right_tail.log_prob(right_distance) + widths[-1].log()
             )
 
         nll = -log_density
@@ -352,8 +345,7 @@ class BarDistributionHead:
         per_bucket = usable // self.num_buckets
 
         inner = (
-            sorted_values[per_bucket - 1 :: per_bucket][:-1]
-            + sorted_values[per_bucket::per_bucket]
+            sorted_values[per_bucket - 1 :: per_bucket][:-1] + sorted_values[per_bucket::per_bucket]
         ) / 2.0
         borders = torch.cat([sorted_values[:1], inner, sorted_values[-1:]])
 

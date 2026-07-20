@@ -26,6 +26,7 @@ ignore = [
 "tests/**/*.py" = ["N803", "N806", "RUF012", "E402"]
 "examples/**/*.py" = ["N803", "N806"]
 "packages/core/pfnstudio_core/axes/*.py" = ["N806", "N812"]
+"packages/core/pfnstudio_core/blocks/grid.py" = ["N803", "N806", "N812"]
 "packages/core/pfnstudio_core/scorers/*.py" = ["N806"]
 "packages/core/pfnstudio_core/training/*.py" = ["N806"]
 # typer/click idiom: Argument/Option calls in defaults are how the framework
@@ -33,6 +34,7 @@ ignore = [
 # default — re-evaluating per-invocation is the point.
 "packages/cli/pfnstudio/cli.py" = ["B008", "N806"]
 "packages/cli/pfnstudio/runner.py" = ["B008"]
+"starters/**/*.py" = ["N803", "N806", "RUF012"]
 
 [tool.pytest.ini_options]
 testpaths = ["packages"]
