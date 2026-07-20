@@ -1,7 +1,7 @@
 id: cid_recovery
 name: Do-PFN CID and CATE recovery
 version: 0.1.0
-task: custom
+task: estimation
 description: >-
   Scores fresh random-DAG tasks and the paper's six structured causal case
   studies. Reports conditional interventional distribution (CID), CATE, ATE
