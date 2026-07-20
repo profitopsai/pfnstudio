@@ -1,0 +1,39 @@
+type: context_query_axial_attention
+name: Context/query axial-attention layer
+version: 0.1.0
+description: >-
+  Post-norm axial transformer layer with Do-PFN-compatible defaults. It applies
+  multi-head attention across feature tokens, then context-only attention
+  across rows, followed by a GELU feed-forward residual update.
+isHead: false
+fields:
+  - key: d_model
+    label: Model dimension
+    kind: number
+    default: 192
+    min: 16
+    step: 16
+    hint: Hidden dimension; must be divisible by the number of heads.
+  - key: n_heads
+    label: Attention heads
+    kind: number
+    default: 6
+    min: 1
+    step: 1
+    hint: Released Do-PFN checkpoint uses 6 heads.
+  - key: ff_mult
+    label: Feed-forward multiplier
+    kind: number
+    default: 4
+    min: 1
+    step: 1
+    hint: Feed-forward hidden width is d_model multiplied by this value.
+  - key: layer_norm_eps
+    label: LayerNorm epsilon
+    kind: number
+    default: 0.00001
+    min: 0.0000001
+    step: 0.0000001
+    hint: Numerical-stability epsilon used by the three post-norm layers.
+citations:
+  - robertson2025dopfn

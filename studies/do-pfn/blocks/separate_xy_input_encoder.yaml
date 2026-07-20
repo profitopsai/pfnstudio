@@ -1,0 +1,40 @@
+type: separate_xy_input_encoder
+name: Separate X/Y input encoder
+version: 0.1.0
+description: >-
+  Context-query encoder that separately embeds grouped X features and a masked
+  Y target. The defaults are compatible with Do-PFN. It replaces the generic grid
+  preprocessor and tabular cell embedder: X features are context-normalized,
+  clipped and grouped, while the outcome is encoded as a separate final token.
+isHead: false
+fields:
+  - key: d_model
+    label: Model dimension
+    kind: number
+    default: 192
+    min: 16
+    step: 16
+    hint: Hidden dimension; keep this equal to the axial layers and output head.
+  - key: num_cols
+    label: Raw grid columns
+    kind: number
+    default: 8
+    min: 2
+    step: 1
+    hint: Expected treatment + covariate + outcome columns; used for diagnostics.
+  - key: features_per_group
+    label: Features per group
+    kind: number
+    default: 85
+    min: 1
+    step: 1
+    hint: Released Do-PFN checkpoint setting; normally leave at 85.
+  - key: clip_value
+    label: Standardized-value clamp
+    kind: number
+    default: 100
+    min: 1
+    step: 1
+    hint: Bounds standardized X values to protect attention forward/backward passes.
+citations:
+  - robertson2025dopfn

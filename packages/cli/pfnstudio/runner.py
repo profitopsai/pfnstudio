@@ -707,6 +707,7 @@ def _core_version() -> str | None:
     invisible when only the CLI version is reported. None if not installed."""
     try:
         from importlib.metadata import PackageNotFoundError, version
+
         try:
             return version("pfnstudio-core")
         except PackageNotFoundError:
@@ -715,6 +716,7 @@ def _core_version() -> str | None:
         pass
     try:
         import pfnstudio_core  # type: ignore
+
         return getattr(pfnstudio_core, "__version__", None)
     except Exception:
         return None
@@ -966,7 +968,7 @@ def status() -> None:
         # the cloud) can spot a CLI/core drift without guessing.
         core_v = _core_version()
         console.print(
-            f"[bold]Core[/bold]            : "
+            "[bold]Core[/bold]            : "
             + (core_v if core_v else "[yellow]not installed[/yellow] — training will fail")
         )
         console.print(f"[bold]Python[/bold]          : {platform.python_version()}")
@@ -1397,7 +1399,7 @@ def start(
         # failed, and keeps polling for the next one.
         try:
             _run_job(base, headers, job, project_root, stop_flag)
-        except Exception as exc:  # noqa: BLE001 — isolation is the whole point
+        except Exception as exc:
             run_id = job.get("runId")
             console.print(
                 f"[red]Job {run_id} crashed the executor — failing it and "

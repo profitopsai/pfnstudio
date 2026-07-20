@@ -21,8 +21,6 @@ Metrics match `cascade_recovery.yaml`: auroc, shd, f1, precision, recall, and
 
 from __future__ import annotations
 
-from typing import Any
-
 from pfnstudio_core.registry import register_scorer
 from pfnstudio_core.scorers.base import DatasetScorer, ScorerResult
 
@@ -40,8 +38,10 @@ class CascadeDiscoveryScorer(DatasetScorer):
             import torch
         except ImportError as e:
             return ScorerResult(
-                metrics={}, meta={"dependency_missing": str(e)},
-                skipped=True, skip_reason=f"missing dependency: {e}",
+                metrics={},
+                meta={"dependency_missing": str(e)},
+                skipped=True,
+                skip_reason=f"missing dependency: {e}",
             )
 
         from pfnstudio_core.registry import get_prior
@@ -51,7 +51,8 @@ class CascadeDiscoveryScorer(DatasetScorer):
             prior_cls = get_prior(run_spec.prior.id)
         except KeyError:
             return ScorerResult(
-                metrics={}, meta={"prior_id": run_spec.prior.id},
+                metrics={},
+                meta={"prior_id": run_spec.prior.id},
                 skipped=True,
                 skip_reason=f"prior '{run_spec.prior.id}' not registered in this project",
             )
@@ -62,7 +63,8 @@ class CascadeDiscoveryScorer(DatasetScorer):
         head = next((h for h in heads if hasattr(h, "num_variables")), None)
         if head is None:
             return ScorerResult(
-                metrics={}, meta={"heads": [type(h).__name__ for h in heads]},
+                metrics={},
+                meta={"heads": [type(h).__name__ for h in heads]},
                 skipped=True,
                 skip_reason=(
                     "Model has no discovery head (a block with num_variables). "

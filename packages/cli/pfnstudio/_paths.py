@@ -24,13 +24,14 @@ def schemas_root() -> Path:
 
 def templates_root() -> Path:
     bundled = _HERE / "_bundled" / "templates"
-    if bundled.exists():
+    if (bundled / "fm-project").is_dir():
         return bundled
     for parent in _HERE.parents:
-        candidate = parent / "templates"
-        if candidate.exists():
-            return candidate
-    raise FileNotFoundError("Could not locate templates/ directory.")
+        for directory in ("templates", "starters"):
+            candidate = parent / directory
+            if (candidate / "fm-project").is_dir():
+                return candidate
+    raise FileNotFoundError("Could not locate templates/fm-project or starters/fm-project.")
 
 
 def fm_project_template() -> Path:

@@ -1,270 +1,408 @@
-"""Bar-distribution (Riemann) output head — PROJECT block.
+"""Paper/checkpoint-faithful Do-PFN bar-distribution head for PFN Studio.
 
-Lives in the project, exactly like a prior or eval; discovered at run time
-(discover_in_project imports blocks/*.py) and referenced from the model by
-its registered type `bar_distribution_head`. Nothing is baked into
-pfnstudio-core — core only provides the generic hooks this block plugs into.
+Paste this entire file into the project's existing
+``blocks/bar_distribution_head.py``.
 
-Instead of regressing a single number, this head predicts a full distribution
-over the outcome by discretizing it into `num_buckets` buckets and emitting a
-logit per bucket (Müller et al. 2022, "Transformers Can Do Bayesian
-Inference"; the same head TabPFN and Do-PFN use). It trains with the proper
-bucketized negative-log-likelihood and, at inference, reports the distribution
-mean as the point estimate.
+The released Do-PFN checkpoint uses:
 
-It opts into three generic, duck-typed hooks the trainer / predict loop call
-when present — core carries no bar-distribution-specific knowledge:
+* decoder: Linear(192, 768) -> GELU -> Linear(768, 100)
+* 100 equal-mass buckets estimated from prior outcomes
+* FullSupportBarDistribution negative log density
+* half-normal tails for the first and last buckets
 
-  - `is_head = True`        → the trainer treats this as an output head (a
-                              project head can't add its class to core's
-                              allowlist, so it declares itself one).
-  - `setup(*, prior, ...)`  → before the first forward pass, pool outcome
-                              samples from the prior and set equal-mass bucket
-                              borders (so buckets carry ~equal probability).
-  - `loss(logits, target)`  → own the loss: bucketized NLL, not MSE.
-  - `to_prediction(output)` → collapse per-bucket logits to the distribution
-                              mean so the predict path gets a scalar.
-
-Authoring conventions (copy for your own head): a plain class decorated with
-@register_block; build torch submodules as attributes; import torch INSIDE the
-methods so discovery never fails when torch is absent; accept **_ so unknown
-config is ignored. The bucket borders are stored as a registered buffer on the
-projection so they travel with the checkpoint and are restored at inference.
+PFN Studio discovers the generic ``setup``, ``loss`` and ``to_prediction``
+hooks used below; no pfnstudio-core modification is required.
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from pfnstudio_core.registry import register_block
 
-# How many prior tasks to pool when fitting bucket borders in setup(), and how
-# many points to draw per task (small — this is a one-time border fit, not
-# training). ~40 × 256 gives enough samples to place 100 equal-mass borders.
-_SETUP_TASKS: int = 10_000
-_SETUP_POINTS: int = 256
-_SETUP_BASE_SEED: int = 987_654
-
-
-def _bar_tensor_stats(name: str, tensor: Any) -> dict[str, Any]:
-    import torch
-
-    t = tensor.detach()
-    finite = torch.isfinite(t)
-    out: dict[str, Any] = {
-        "name": name,
-        "shape": tuple(t.shape),
-        "numel": int(t.numel()),
-        "finite": int(finite.sum().item()),
-        "nan": int(torch.isnan(t).sum().item()),
-        "posinf": int(torch.isposinf(t).sum().item()),
-        "neginf": int(torch.isneginf(t).sum().item()),
-    }
-    if finite.any():
-        vals = t[finite]
-        out["min"] = float(vals.min().item())
-        out["max"] = float(vals.max().item())
-        out["max_abs"] = float(vals.abs().max().item())
-    return out
-
 
 @register_block("bar_distribution_head")
 class BarDistributionHead:
-    """Distributional regression head over `num_buckets` outcome buckets."""
+    """Do-PFN decoder plus full-support bar-distribution criterion."""
 
-    # Opt into the trainer's head fan-out without editing core's allowlist.
-    is_head = True
+    # Project-defined output heads opt into PFN Studio's parallel head path.
+    is_head: bool = True
 
-    def __init__(self, d_model: int = 256, num_buckets: int = 100, **_: Any) -> None:
+    def __init__(
+        self,
+        d_model: int = 192,
+        hidden_dim: int = 768,
+        num_buckets: int = 100,
+        setup_tasks: int = 100,
+        setup_points: int = 256,
+        setup_seed: int = 987_654,
+        tail_mass_within_edge: float = 0.5,
+        min_bucket_width: float = 1.0e-6,
+        log_first_n: int = 3,
+        seed: int = 42,
+        **_: Any,
+    ) -> None:
         import torch
         import torch.nn as nn
 
+        self.d_model = int(d_model)
+        self.hidden_dim = int(hidden_dim)
         self.num_buckets = int(num_buckets)
-        self.proj = nn.Linear(d_model, self.num_buckets)
-        # Bucket borders (num_buckets + 1 boundaries). Registered as a buffer
-        # ON proj so it (a) moves with .to(device), (b) is saved in proj's
-        # state_dict and restored at inference. Placeholder until setup() fits
-        # it to the prior; a wide linspace keeps predict sane even if a
-        # checkpoint predates setup.
-        self.proj.register_buffer(
-            "bar_borders", torch.linspace(-3.0, 3.0, self.num_buckets + 1)
+        self.setup_tasks = int(setup_tasks)
+        self.setup_points = int(setup_points)
+        self.setup_seed = int(setup_seed)
+        self.tail_mass_within_edge = float(tail_mass_within_edge)
+        self.min_bucket_width = float(min_bucket_width)
+        self.log_first_n = max(0, int(log_first_n))
+        self._loss_calls = 0
+
+        if self.d_model <= 0 or self.hidden_dim <= 0:
+            raise ValueError("d_model and hidden_dim must be positive.")
+        if self.num_buckets < 2:
+            raise ValueError("num_buckets must be at least 2.")
+        if self.setup_tasks <= 0 or self.setup_points <= 1:
+            raise ValueError("setup_tasks must be > 0 and setup_points must be > 1.")
+        if not 0.0 < self.tail_mass_within_edge < 1.0:
+            raise ValueError("tail_mass_within_edge must be between 0 and 1.")
+        if self.min_bucket_width <= 0.0:
+            raise ValueError("min_bucket_width must be positive.")
+
+        # Isolate initialization so this project block does not change the RNG
+        # used to initialize subsequent modules.
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(int(seed))
+            self.decoder = nn.Sequential(
+                nn.Linear(self.d_model, self.hidden_dim),
+                nn.GELU(),
+                nn.Linear(self.hidden_dim, self.num_buckets),
+            )
+
+        # setup() replaces these before a fresh run. Keeping borders on the
+        # decoder makes them move, save and restore with this block's weights.
+        self.decoder.register_buffer(
+            "bar_borders",
+            torch.linspace(-10.0, 10.0, self.num_buckets + 1),
+        )
+        self.decoder.register_buffer(
+            "bar_borders_ready",
+            torch.tensor(False, dtype=torch.bool),
         )
 
     def __call__(self, x: Any) -> Any:
-        # (B, N, d_model) -> (B, N, num_buckets) per-bucket logits.
-        return self.proj(x)
+        return self.forward(x)
 
-    # ── generic pre-training setup hook ────────────────────────────────────
+    def forward(self, x: Any) -> Any:
+        import torch
+
+        if not torch.is_tensor(x) or x.shape[-1] != self.d_model:
+            shape = tuple(x.shape) if torch.is_tensor(x) else type(x).__name__
+            raise ValueError(
+                "bar_distribution_head expects (..., d_model) input with "
+                f"d_model={self.d_model}; got {shape}."
+            )
+        logits = self.decoder(x)
+        if not torch.isfinite(logits).all():
+            self._log("error", "non_finite_logits", **self._stats(logits))
+            raise FloatingPointError("bar_distribution_head produced NaN/Inf logits.")
+        return logits
+
     def setup(
-        self, *, prior: Any, hp: dict | None = None, device: Any = None, **_: Any
+        self,
+        *,
+        prior: Any,
+        hp: dict[str, Any] | None = None,
+        device: Any = None,
+        **_: Any,
     ) -> None:
+        """Estimate equal-mass borders from the same prior used for training.
+
+        The released checkpoint configuration uses ``bar_dist_init_batches=100``;
+        ``setup_tasks=100`` mirrors that one-time initialization scale.
+        """
         import numpy as np
         import torch
 
         pooled: list[np.ndarray] = []
-        for i in range(_SETUP_TASKS):
+        failed = 0
+        invalid = 0
+
+        for index in range(self.setup_tasks):
             try:
-                task = prior.sample(
-                    seed=_SETUP_BASE_SEED + i, num_samples=_SETUP_POINTS
-                )
-            except TypeError:
-                # Prior.sample without a num_samples kwarg — fall back to defaults.
-                task = prior.sample(seed=_SETUP_BASE_SEED + i)
-            # Query targets (the loss targets) …
-            y = np.asarray(task.get("y", []), dtype=np.float32).ravel()
-            pooled.append(y)
-            # … plus context outcomes carried in X's y-column (col d+1),
-            # finite rows only (query rows are NaN there).
-            X = np.asarray(task.get("X", []), dtype=np.float32)
-            if X.ndim == 2 and X.shape[1] >= 1:
-                ycol = X[:, -1]
-                pooled.append(ycol[np.isfinite(ycol)])
+                try:
+                    task = prior.sample(
+                        seed=self.setup_seed + index,
+                        num_samples=self.setup_points,
+                    )
+                except TypeError:
+                    task = prior.sample(seed=self.setup_seed + index)
+            except Exception as exc:
+                failed += 1
+                if failed <= 3:
+                    self._log(
+                        "warning",
+                        "border_sample_failed",
+                        sample=index,
+                        exception_type=type(exc).__name__,
+                        reason=str(exc),
+                    )
+                continue
 
-        ally = (
-            np.concatenate([p for p in pooled if p.size])
-            if pooled
-            else np.zeros(1, np.float32)
-        )
-        ally = ally[np.isfinite(ally)]
-        print(
-            "[bar_distribution_head] setup pooled outcomes "
-            f"tasks={_SETUP_TASKS} "
-            f"points_per_task={_SETUP_POINTS} "
-            f"finite_values={int(ally.size)} "
-            f"min={float(ally.min()) if ally.size else None} "
-            f"max={float(ally.max()) if ally.size else None} "
-            f"std={float(ally.std()) if ally.size else None}",
-            flush=True,
-        )
-        if ally.size < self.num_buckets + 1:
-            # Degenerate prior draw — keep the linspace placeholder.
-            return
+            if task.get("is_valid", True) is False:
+                invalid += 1
+                continue
 
-        # Equal-mass borders: quantiles at evenly spaced probabilities. Nudge
-        # to strictly increasing so bucketize + widths stay well-defined even
-        # when the outcome has point masses (e.g. binary-ish treatments).
-        qs = np.linspace(0.0, 1.0, self.num_buckets + 1)
-        borders = np.quantile(ally, qs).astype(np.float64)
-        eps = 1e-6 * (float(ally.std()) + 1.0)
-        for j in range(1, borders.size):
-            if borders[j] <= borders[j - 1]:
-                borders[j] = borders[j - 1] + eps
+            # Query interventional outcomes used as loss targets.
+            query_y = np.asarray(task.get("y", []), dtype=np.float32).reshape(-1)
+            if query_y.size:
+                pooled.append(query_y[np.isfinite(query_y)])
 
-        borders_t = torch.as_tensor(borders, dtype=self.proj.bar_borders.dtype)
-        if device is not None:
-            borders_t = borders_t.to(device)
-        self.proj.bar_borders.copy_(borders_t)
-        print(
-            "[bar_distribution_head] setup borders "
-            f"num_buckets={self.num_buckets} "
-            f"border_min={float(borders_t.min().item())} "
-            f"border_max={float(borders_t.max().item())} "
-            f"min_width={float((borders_t[1:] - borders_t[:-1]).min().item())} "
-            f"max_width={float((borders_t[1:] - borders_t[:-1]).max().item())}",
-            flush=True,
-        )
+            # Observed context outcomes stored in the raw grid's final column.
+            grid = np.asarray(task.get("X", []), dtype=np.float32)
+            if grid.ndim == 2 and grid.shape[1] >= 1:
+                context_y = grid[:, -1]
+                pooled.append(context_y[np.isfinite(context_y)])
 
-    @staticmethod
-    def _halfnormal_with_p_weight_before(range_max: Any, p: float = 0.5) -> Any:
-        import torch
-
-        p_t = torch.tensor(p, device=range_max.device, dtype=range_max.dtype)
-        one = torch.tensor(1.0, device=range_max.device, dtype=range_max.dtype)
-        unit = torch.distributions.HalfNormal(one)
-        scale = range_max / unit.icdf(p_t).clamp_min(1e-8)
-        return torch.distributions.HalfNormal(scale.clamp_min(1e-8))
-
-    # ── generic custom-loss hook (bucketized NLL) ──────────────────────────
-    def loss(self, logits: Any, target: Any) -> Any:
-        import torch
-        import torch.nn.functional as F  # noqa: N812
-
-        borders = self.proj.bar_borders.to(device=logits.device, dtype=logits.dtype)
-        nb = borders.numel() - 1
-
-        logits = logits.reshape(-1, nb)
-        target = target.reshape(-1).to(device=logits.device, dtype=logits.dtype)
-
-        if not torch.isfinite(borders).all():
-            print(
-                "[bar_distribution_head] non-finite bucket borders "
-                f"borders={_bar_tensor_stats('borders', borders)}",
-                flush=True,
+        nonempty = [values for values in pooled if values.size]
+        if not nonempty:
+            self._log(
+                "error",
+                "border_setup_no_values",
+                setup_tasks=self.setup_tasks,
+                failed=failed,
+                invalid=invalid,
             )
-            raise RuntimeError("BAR head has non-finite bucket borders.")
+            raise RuntimeError("Could not collect any finite Y values for BAR borders.")
+
+        values_np = np.concatenate(nonempty).astype(np.float32, copy=False)
+        values_np = values_np[np.isfinite(values_np)]
+        if values_np.size <= self.num_buckets:
+            raise RuntimeError(
+                "BAR border setup needs more finite outcomes than buckets: "
+                f"values={values_np.size}, buckets={self.num_buckets}."
+            )
+
+        values = torch.as_tensor(values_np, dtype=torch.float32)
+        borders = self._equal_mass_borders(values)
+        if device is not None:
+            borders = borders.to(device)
+        borders = borders.to(
+            device=self.decoder.bar_borders.device,
+            dtype=self.decoder.bar_borders.dtype,
+        )
+        self.decoder.bar_borders.copy_(borders)
+        self.decoder.bar_borders_ready.fill_(True)
 
         widths = borders[1:] - borders[:-1]
-        if not torch.isfinite(widths).all() or (widths <= 0).any():
-            print(
-                "[bar_distribution_head] invalid bucket widths "
-                f"borders={_bar_tensor_stats('borders', borders)} "
-                f"widths={_bar_tensor_stats('widths', widths)}",
-                flush=True,
-            )
-            raise RuntimeError("BAR head has invalid bucket widths.")
-
-        finite_target = torch.isfinite(target)
-        finite_logits = torch.isfinite(logits).all(dim=-1)
-        valid = finite_target & finite_logits
-
-        if valid.sum() == 0:
-            print(
-                "[bar_distribution_head] no valid target/logit rows "
-                f"target={_bar_tensor_stats('target', target)} "
-                f"logits={_bar_tensor_stats('logits', logits)} "
-                f"borders={_bar_tensor_stats('borders', borders)} "
-                f"widths={_bar_tensor_stats('widths', widths)}",
-                flush=True,
-            )
-            raise RuntimeError("BAR head got no finite target/logit rows.")
-
-        if (~finite_logits & finite_target).any():
-            print(
-                "[bar_distribution_head] dropping non-finite logit rows "
-                f"finite_targets={int(finite_target.sum().item())} "
-                f"finite_logits={int(finite_logits.sum().item())} "
-                f"valid={int(valid.sum().item())} "
-                f"target={_bar_tensor_stats('target', target)} "
-                f"logits={_bar_tensor_stats('logits', logits)}",
-                flush=True,
-            )
-
-        logits = logits[valid].clamp(-60.0, 60.0)
-        target = target[valid]
-
-        # Stable BAR training path:
-        # map each continuous target to one bucket, then use cross entropy.
-        # This avoids fragile density/tail math that can create NaN gradients.
-        target = target.clamp(
-            min=borders[0].detach(),
-            max=borders[-1].detach(),
+        self._log(
+            "info",
+            "border_setup_complete",
+            setup_tasks=self.setup_tasks,
+            failed=failed,
+            invalid=invalid,
+            finite_values=int(values_np.size),
+            outcome_min=float(values_np.min()),
+            outcome_max=float(values_np.max()),
+            outcome_mean=float(values_np.mean()),
+            outcome_std=float(values_np.std()),
+            buckets=self.num_buckets,
+            border_min=float(borders[0].item()),
+            border_max=float(borders[-1].item()),
+            min_bucket_width=float(widths.min().item()),
+            max_bucket_width=float(widths.max().item()),
         )
 
-        bucket_idx = torch.bucketize(target, borders, right=False) - 1
-        bucket_idx = bucket_idx.clamp(0, nb - 1).long()
+    def loss(self, logits: Any, target: Any) -> Any:
+        """Mean FullSupportBarDistribution negative log density."""
+        import torch
+        import torch.nn.functional as functional
 
-        loss = F.cross_entropy(logits, bucket_idx)
+        if logits.shape[-1] != self.num_buckets:
+            raise ValueError(f"Expected {self.num_buckets} logits; got {logits.shape[-1]}.")
+        if not torch.isfinite(logits).all():
+            self._log("error", "non_finite_logits_in_loss", **self._stats(logits))
+            raise FloatingPointError("BAR loss received NaN/Inf logits.")
 
-        if not torch.isfinite(loss):
-            print(
-                "[bar_distribution_head] non-finite CE loss "
-                f"loss={float(loss.detach().item()) if loss.numel() else None} "
-                f"target={_bar_tensor_stats('target', target)} "
-                f"logits={_bar_tensor_stats('logits', logits)} "
-                f"bucket_idx={_bar_tensor_stats('bucket_idx', bucket_idx.float())} "
-                f"borders={_bar_tensor_stats('borders', borders)} "
-                f"widths={_bar_tensor_stats('widths', widths)}",
-                flush=True,
+        borders = self.decoder.bar_borders.to(
+            device=logits.device,
+            dtype=logits.dtype,
+        )
+        widths = borders[1:] - borders[:-1]
+        if not torch.isfinite(borders).all() or not torch.isfinite(widths).all():
+            raise FloatingPointError("BAR borders contain NaN/Inf.")
+        if (widths <= 0).any():
+            raise ValueError("BAR borders must be strictly increasing.")
+
+        flat_logits = logits.reshape(-1, self.num_buckets)
+        flat_target = target.to(
+            device=logits.device,
+            dtype=logits.dtype,
+        ).reshape(-1)
+        if flat_logits.shape[0] != flat_target.shape[0]:
+            raise ValueError(
+                f"BAR logits/target row mismatch: {flat_logits.shape[0]} vs {flat_target.shape[0]}."
             )
-            raise RuntimeError("BAR head produced non-finite cross-entropy loss.")
 
-        return loss
+        valid = torch.isfinite(flat_target)
+        if not valid.any():
+            self._log("error", "no_finite_targets", **self._stats(flat_target))
+            raise FloatingPointError("BAR loss received no finite targets.")
+        logits_valid = flat_logits[valid]
+        y = flat_target[valid]
 
-    # ── generic prediction-reduction hook (distribution mean) ──────────────
+        # The bucket probability is converted to a density by dividing by its
+        # width. Plain cross-entropy omits this term and is not BAR NLL.
+        bucket_idx = torch.searchsorted(borders, y) - 1
+        bucket_idx = bucket_idx.clamp(0, self.num_buckets - 1).long()
+        scaled_log_probs = functional.log_softmax(logits_valid, dim=-1) - widths.log()
+        log_density = scaled_log_probs.gather(1, bucket_idx[:, None]).squeeze(1)
+
+        # Full support: replace the uniform density shape in the two edge bars
+        # with half-normal tails extending to -inf/+inf. This is the released
+        # FullSupportBarDistribution.forward calculation.
+        left_mask = bucket_idx == 0
+        right_mask = bucket_idx == self.num_buckets - 1
+        left_tail = self._edge_halfnormal(widths[0])
+        right_tail = self._edge_halfnormal(widths[-1])
+
+        if left_mask.any():
+            left_distance = (borders[1] - y[left_mask]).clamp_min(1.0e-8)
+            log_density[left_mask] = (
+                log_density[left_mask] + left_tail.log_prob(left_distance) + widths[0].log()
+            )
+        if right_mask.any():
+            right_distance = (y[right_mask] - borders[-2]).clamp_min(1.0e-8)
+            log_density[right_mask] = (
+                log_density[right_mask] + right_tail.log_prob(right_distance) + widths[-1].log()
+            )
+
+        nll = -log_density
+        result = nll.mean()
+        if not torch.isfinite(result):
+            self._log(
+                "error",
+                "non_finite_bar_nll",
+                logits=self._stats(logits_valid),
+                targets=self._stats(y),
+                borders=self._stats(borders),
+                nll=self._stats(nll),
+            )
+            raise FloatingPointError("Full-support BAR NLL became NaN/Inf.")
+
+        self._loss_calls += 1
+        if self._loss_calls <= self.log_first_n:
+            counts = torch.bincount(bucket_idx, minlength=self.num_buckets)
+            self._log(
+                "info",
+                "loss_summary",
+                call=self._loss_calls,
+                loss=float(result.detach().item()),
+                valid_targets=int(valid.sum().item()),
+                ignored_targets=int((~valid).sum().item()),
+                left_tail_targets=int(left_mask.sum().item()),
+                right_tail_targets=int(right_mask.sum().item()),
+                occupied_buckets=int((counts > 0).sum().item()),
+                target_min=float(y.min().item()),
+                target_max=float(y.max().item()),
+                logits_max_abs=float(logits_valid.detach().abs().max().item()),
+            )
+        return result
+
     def to_prediction(self, output: Any) -> Any:
-        import torch.nn.functional as F  # noqa: N812
+        """Return the full-support distribution mean as a scalar prediction."""
+        import torch
+        import torch.nn.functional as functional
 
-        borders = self.proj.bar_borders
-        centers = 0.5 * (borders[1:] + borders[:-1])  # (nb,)
-        probs = F.softmax(output, dim=-1)  # (..., nb)
-        return (probs * centers).sum(dim=-1, keepdim=True)  # (..., 1)
+        borders = self.decoder.bar_borders.to(
+            device=output.device,
+            dtype=output.dtype,
+        )
+        widths = borders[1:] - borders[:-1]
+        bucket_means = borders[:-1] + widths / 2.0
+
+        left_tail = self._edge_halfnormal(widths[0])
+        right_tail = self._edge_halfnormal(widths[-1])
+        bucket_means = bucket_means.clone()
+        bucket_means[0] = borders[1] - left_tail.mean
+        bucket_means[-1] = borders[-2] + right_tail.mean
+
+        probs = functional.softmax(output, dim=-1)
+        mean = (probs * bucket_means).sum(dim=-1, keepdim=True)
+        if not torch.isfinite(mean).all():
+            self._log("error", "non_finite_prediction_mean", **self._stats(mean))
+            raise FloatingPointError("BAR distribution mean became NaN/Inf.")
+        return mean
+
+    def _equal_mass_borders(self, values: Any) -> Any:
+        """Match Do-PFN's get_bucket_limits equal-count midpoint algorithm."""
+        import torch
+
+        values = values.flatten()
+        values = values[torch.isfinite(values)]
+        usable = int(values.numel()) - (int(values.numel()) % self.num_buckets)
+        values = values[:usable]
+        sorted_values = values.sort().values
+        per_bucket = usable // self.num_buckets
+
+        inner = (
+            sorted_values[per_bucket - 1 :: per_bucket][:-1] + sorted_values[per_bucket::per_bucket]
+        ) / 2.0
+        borders = torch.cat([sorted_values[:1], inner, sorted_values[-1:]])
+
+        # Continuous Do-PFN outcomes normally make these strict already. The
+        # nudge protects the density calculation if a custom prior has atoms.
+        scale = max(float(sorted_values.std(unbiased=False).item()), 1.0)
+        min_width = max(self.min_bucket_width, self.min_bucket_width * scale)
+        borders = borders.clone()
+        for index in range(1, borders.numel()):
+            if borders[index] <= borders[index - 1]:
+                borders[index] = borders[index - 1] + min_width
+        return borders
+
+    def _edge_halfnormal(self, edge_width: Any) -> Any:
+        import torch
+
+        one = edge_width.new_tensor(1.0)
+        probability = edge_width.new_tensor(self.tail_mass_within_edge)
+        unit = torch.distributions.HalfNormal(one)
+        scale = edge_width / unit.icdf(probability).clamp_min(1.0e-8)
+        return torch.distributions.HalfNormal(scale.clamp_min(1.0e-8))
+
+    @staticmethod
+    def _stats(value: Any) -> dict[str, Any]:
+        import torch
+
+        detached = value.detach()
+        finite = torch.isfinite(detached)
+        result: dict[str, Any] = {
+            "shape": list(detached.shape),
+            "numel": int(detached.numel()),
+            "finite": int(finite.sum().item()),
+            "nan": int(torch.isnan(detached).sum().item()),
+            "posinf": int(torch.isposinf(detached).sum().item()),
+            "neginf": int(torch.isneginf(detached).sum().item()),
+        }
+        if finite.any():
+            vals = detached[finite]
+            result.update(
+                min=float(vals.min().item()),
+                max=float(vals.max().item()),
+                max_abs=float(vals.abs().max().item()),
+            )
+        return result
+
+    @staticmethod
+    def _log(level: str, message: str, **fields: Any) -> None:
+        print(
+            json.dumps(
+                {
+                    "event": "bar_distribution_head",
+                    "level": level,
+                    "message": message,
+                    **fields,
+                },
+                sort_keys=True,
+                default=str,
+            ),
+            flush=True,
+        )
