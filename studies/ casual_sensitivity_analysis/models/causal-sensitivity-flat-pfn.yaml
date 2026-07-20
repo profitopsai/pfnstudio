@@ -1,0 +1,35 @@
+id: causal-sensitivity-flat-pfn
+name: Causal Sensitivity Flat PFN (DEFAULT — proven trainer path)
+version: 0.1.0
+description: >
+  The production model for this project. Verified end-to-end on sanity-test-v1
+  (2026-07-07): d_in=15, loss 355 -> 0.86 over 50 steps, no NaN. Matches paper
+  Table 1 dims: embedding 128, 4 heads, FF 512 (ff_mult 4), 10 layers. Deviation
+  vs paper: flat row-token attention instead of TabPFN-style per-feature (axial)
+  attention — the axial block stack currently produces NaN gradients in Studio
+  (see the experimental axial yaml); switch back when Studio fixes it. Other
+  documented deviations: single scalar head + bound_flag row duplication instead
+  of two 5-component GMM heads with NLL; no monotonicity penalty (apply
+  cumulative max/min over Gamma post-hoc at inference). Consumes the zero_packed
+  D+5=15-column contract from causal_sensitivity_msm_analytical.
+input_shape: (B, N, 15)
+blocks:
+  - type: tabular_embedder
+    config:
+      d_model: 128
+  - type: transformer_encoder
+    config:
+      d_model: 128
+      n_heads: 4
+      n_layers: 10
+      dropout: 0.1
+      ff_mult: 4
+  - type: scalar_head
+    name: head
+    config:
+      d_model: 128
+      d_out: 1
+output_heads:
+  - name: theta_star
+    task: regression
+citations: []

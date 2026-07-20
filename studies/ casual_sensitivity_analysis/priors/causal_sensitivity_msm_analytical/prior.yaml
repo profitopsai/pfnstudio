@@ -1,0 +1,60 @@
+id: causal_sensitivity_msm_analytical
+name: causal_sensitivity_msm_analytical
+version: 0.3.0
+kind: scm
+description: >
+  Analytical closed-form MSM sensitivity-bound labels (the paper's PRIMARY
+  training run, Table 2 "Analytical MSM"). Gamma ~ log-uniform [1, 5], redrawn
+  per query group; single MC bank of 128 U-samples reused across queries; sharp
+  Dorn-Guo-style two-level solution (verified vs brute-force LP). CPU-only,
+  ~seconds/DGP. Emits zero_packed D+5 tokens (is_context flag, no NaN) — the
+  proven trainer contract. Includes degenerate-DGP re-roll guard. MAIN-RUN
+  defaults below (seq 1664); for sanity set N=256, n_queries=8, n_gamma=4 in the
+  form and verify via the [prior] log line.
+parameters:
+  D:
+    type: int
+    range:
+      - 10
+      - 10
+  N:
+    type: int
+    range:
+      - 1024
+      - 1024
+  n_gamma:
+    type: int
+    range:
+      - 5
+      - 5
+  n_queries:
+    type: int
+    range:
+      - 32
+      - 32
+outputs:
+  variables:
+    - name: X
+      type: matrix
+      shape: (N+M, D+5)
+    - name: theta_star
+      role: target
+      type: matrix
+      shape: (M, 1)
+    - name: n_ctx
+      role: context_length
+      type: scalar
+    - name: gamma
+      type: matrix
+      shape: (M, 1)
+    - name: bound_type
+      type: matrix
+      shape: (M, 1)
+    - name: query_id
+      type: matrix
+      shape: (M, 1)
+    - name: source_row_index
+      type: matrix
+      shape: (M, 1)
+citations: []
+implementation: prior.py

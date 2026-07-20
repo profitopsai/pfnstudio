@@ -1,0 +1,21 @@
+id: causal-sensitivity-msm-bounds
+name: Causal Sensitivity MSM Bounds (analytical labels)
+version: 0.1.0
+task: regression
+description: >
+  Regression eval on held-out draws from the analytical-MSM prior. Labels are
+  exact (closed form), so eval error measures the PFN alone with no label noise.
+  Gate for the full run: RMSE must beat predict-0 and predict-context-mean
+  baselines; also check predictions are monotone in Gamma per (query, arm,
+  bound) group using the gamma/bound_type/query_id diagnostics.
+dataset:
+  name: synthetic_causal_sensitivity_msm_analytical
+  split: test
+  source: priors/causal_sensitivity_msm_analytical
+  version: 0.1.0
+metrics:
+  - name: rmse
+  - name: mae
+  - name: r2
+baselines: []
+citations: []
