@@ -1,113 +1,153 @@
 id: do_pfn
-name: Do-PFN — axial-attention transformer (Robertson et al., 2025)
+name: Do-PFN - checkpoint-compatible axial transformer (Robertson et al., 2025)
 version: 0.1.0
-description: "PFN Studio reproduction of Do-PFN (Robertson et al., NeurIPS 2025). Paper-faithful architecture composed from the studio block library: grid_preprocessor → tabular_cell_embedder → 12× axial_attention_block → row_pool_for_head → bar_distribution_head. Each axial block applies row-axis attention (cells within a row attend to each other) then column-axis attention (each cell in a column attends to other rows via train/test KV cache), then a position-wise MLP. d_model=192, n_heads=6, ff_mult=4 — same as the paper. The bar-distribution head (a project block) predicts a full outcome distribution over 100 equal-mass buckets per query position — trained with bucketized NLL, reported as the distribution mean; loss at query positions only via the in-context y-feature column."
+description: >-
+  PFN Studio reproduction of the released Do-PFN architecture. The custom
+  input encoder separately embeds grouped X features and the masked Y target;
+  12 custom post-norm axial layers perform full multi-head feature attention
+  and context-only row attention; the Y token is decoded by a full-support
+  100-bucket bar-distribution head.
 narrative: |-
-  Given a table of "things that happened" — process settings, conditions, outcomes — it answers: *"if I do X instead of Y, what's the predicted outcome?"* without ever being told the causal rules.
+  Given observational context and intervention queries, this model predicts
+  the conditional interventional outcome distribution.
 
-  The pipeline is five stages:
-
-    1. **preprocess** — clean the table: fill in missing values, put everything on the same scale.
-    2. **embed** — turn each number into a richer "fingerprint" the rest of the model can reason with (so `75.3` isn't just a number, it carries context).
-    3. **L1 → L12** — the thinking. Each of 12 layers does two things: **row attention** ("this temperature relates to that pressure at the same time") and **column attention** ("this temperature at hour 100 relates to other temperatures across history"). Stacking 12 layers is like reading the table 12 times.
-    4. **pool** — once the model has thought hard, grab the cell that represents "the answer."
-    5. **head** — turn that cell into a single number prediction.
-
-  What makes this different from a normal ML model: a normal model is trained to predict yield from temperature in *your* factory. Do-PFN was trained on millions of *made-up* factories, so it learned how to do causal reasoning in general. You hand it your factory's data at runtime, it figures out your specific patterns on the fly. No retraining. No graph required.
-inputShape: (B, N, d+2)
+  1. The Do-PFN input encoder context-normalizes and clips X, groups X using
+     the released checkpoint setting, and appends Y as a separate masked token.
+  2. Twelve Do-PFN axial layers attend across feature tokens and then across
+     rows, with query rows restricted to context keys and values.
+  3. The Y-token readout selects the outcome representation.
+  4. The full-support bar head predicts 100 outcome-density buckets; its mean
+     is used as the point estimate.
+input_shape: (B, N, d+2)
 blocks:
-  - type: grid_preprocessor
-    name: preprocess
-    config: {}
-  - type: tabular_cell_embedder
-    name: embed
+  - type: separate_xy_input_encoder
+    name: input_encoder
     config:
       d_model: 192
+      num_cols: 8
       features_per_group: 85
-  - type: axial_attention_block
-    name: L1
+      normalize_by_used_features: true
+      clip_value: 100.0
+      eps: 1.0e-6
+      bias: true
+      seed: 42
+      log_first_n: 3
+  - type: context_query_axial_attention
+    name: axial_layer_01
     config:
       d_model: 192
       n_heads: 6
       ff_mult: 4
-  - type: axial_attention_block
-    name: L2
+      layer_norm_eps: 1.0e-5
+      log_first_n: 1
+  - type: context_query_axial_attention
+    name: axial_layer_02
     config:
       d_model: 192
       n_heads: 6
       ff_mult: 4
-  - type: axial_attention_block
-    name: L3
+      layer_norm_eps: 1.0e-5
+      log_first_n: 1
+  - type: context_query_axial_attention
+    name: axial_layer_03
     config:
       d_model: 192
       n_heads: 6
       ff_mult: 4
-  - type: axial_attention_block
-    name: L4
+      layer_norm_eps: 1.0e-5
+      log_first_n: 1
+  - type: context_query_axial_attention
+    name: axial_layer_04
     config:
       d_model: 192
       n_heads: 6
       ff_mult: 4
-  - type: axial_attention_block
-    name: L5
+      layer_norm_eps: 1.0e-5
+      log_first_n: 1
+  - type: context_query_axial_attention
+    name: axial_layer_05
     config:
       d_model: 192
       n_heads: 6
       ff_mult: 4
-  - type: axial_attention_block
-    name: L6
+      layer_norm_eps: 1.0e-5
+      log_first_n: 1
+  - type: context_query_axial_attention
+    name: axial_layer_06
     config:
       d_model: 192
       n_heads: 6
       ff_mult: 4
-  - type: axial_attention_block
-    name: L7
+      layer_norm_eps: 1.0e-5
+      log_first_n: 1
+  - type: context_query_axial_attention
+    name: axial_layer_07
     config:
       d_model: 192
       n_heads: 6
       ff_mult: 4
-  - type: axial_attention_block
-    name: L8
+      layer_norm_eps: 1.0e-5
+      log_first_n: 1
+  - type: context_query_axial_attention
+    name: axial_layer_08
     config:
       d_model: 192
       n_heads: 6
       ff_mult: 4
-  - type: axial_attention_block
-    name: L9
+      layer_norm_eps: 1.0e-5
+      log_first_n: 1
+  - type: context_query_axial_attention
+    name: axial_layer_09
     config:
       d_model: 192
       n_heads: 6
       ff_mult: 4
-  - type: axial_attention_block
-    name: L10
+      layer_norm_eps: 1.0e-5
+      log_first_n: 1
+  - type: context_query_axial_attention
+    name: axial_layer_10
     config:
       d_model: 192
       n_heads: 6
       ff_mult: 4
-  - type: axial_attention_block
-    name: L11
+      layer_norm_eps: 1.0e-5
+      log_first_n: 1
+  - type: context_query_axial_attention
+    name: axial_layer_11
     config:
       d_model: 192
       n_heads: 6
       ff_mult: 4
-  - type: axial_attention_block
-    name: L12
+      layer_norm_eps: 1.0e-5
+      log_first_n: 1
+  - type: context_query_axial_attention
+    name: axial_layer_12
     config:
       d_model: 192
       n_heads: 6
       ff_mult: 4
+      layer_norm_eps: 1.0e-5
+      log_first_n: 1
   - type: row_pool_for_head
-    name: pool
+    name: y_token
     config:
-      target_col: 0
+      target_col: 1
   - type: bar_distribution_head
-    name: head
+    name: interventional_distribution
     config:
       d_model: 192
+      hidden_dim: 768
       num_buckets: 100
-outputHeads:
-  - name: pred_intervention
-    task: regression
+      setup_tasks: 100
+      setup_points: 256
+      setup_seed: 987654
+      tail_mass_within_edge: 0.5
+      min_bucket_width: 1.0e-6
+      seed: 42
+      log_first_n: 3
+output_heads:
+  - name: interventional_distribution
+    task: custom
 citations:
   - robertson2025dopfn
   - mueller2022pfn

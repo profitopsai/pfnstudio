@@ -1,8 +1,11 @@
 id: cid_recovery
-name: CID + CATE recovery — Do-PFN vs naive vs oracle
+name: Do-PFN CID and CATE recovery
 version: 0.1.0
-task: cate
-description: 50 fresh DGPs from the same prior. Scores interventional outcome prediction (CID-MSE, range-normalized CID-NMSE) and derived CATE (paired do(0)/do(1) queries) against the SCM's ground-truth Y_int and a Monte-Carlo oracle CATE E[Y|do(1),X]-E[Y|do(0),X]. Also reports PICP (90% predictive-interval coverage) for the bar head's uncertainty. Compared to a per-task ridge baseline (biased under confounding) and the oracle floor.
+task: custom
+description: >-
+  Scores fresh random-DAG tasks and the paper's six structured causal case
+  studies. Reports conditional interventional distribution (CID), CATE, ATE
+  bias, naive-ridge comparisons, and 90-percent predictive-interval coverage.
 dataset:
   name: synthetic_fresh_prior_draws
   source: priors/do_pfn_scm
@@ -11,43 +14,58 @@ dataset:
 metrics:
   - name: cid_mse
     higher_is_better: false
-    description: PFN interventional outcome vs oracle Y_int
+    description: Do-PFN interventional-outcome MSE on fresh random-DAG tasks.
   - name: cid_nmse
     higher_is_better: false
-    description: Range-normalized CID MSE (the paper's primary metric)
+    description: Range-normalized CID MSE, the paper's primary CID metric.
   - name: cate_mse
     higher_is_better: false
-    description: PFN-derived CATE vs Monte-Carlo oracle CATE
+    description: Predicted CATE MSE against the Monte Carlo SCM oracle.
   - name: cate_nmse
     higher_is_better: false
-    description: Range-normalized CATE MSE
+    description: Range-normalized CATE MSE.
   - name: naive_cate_mse
     higher_is_better: false
-    description: Per-task ridge baseline — biased under confounding
-  - name: oracle_cate_mse
-    higher_is_better: false
-    description: MC oracle vs itself — the achievable floor (0)
+    description: Per-task observational ridge baseline CATE MSE.
   - name: ratio_vs_naive_cate
     higher_is_better: true
-    description: naive_cate_mse / cate_mse — beats-naive multiplier
-  - name: ratio_vs_oracle_cate
-    higher_is_better: false
-    description: absolute CATE MSE vs the MC oracle — closeness to perfect causal recovery
+    description: Naive ridge CATE MSE divided by Do-PFN CATE MSE.
   - name: ate_error
     higher_is_better: false
-    description: "|mean model CATE − mean oracle CATE| — average treatment-effect bias"
+    description: Absolute average-treatment-effect error.
   - name: picp_90
     higher_is_better: false
-    description: Central-90% predictive-interval coverage of the bar head (target 0.90)
+    description: Central 90-percent predictive-interval coverage.
   - name: picp_90_gap
     higher_is_better: false
-    description: "|picp_90 − 0.90| — calibration error (lower = better)"
+    description: Absolute distance between PICP and the 0.90 target.
+  - name: case6_cid_mse
+    higher_is_better: false
+    description: Aggregate CID MSE across the six structured case studies.
+  - name: case6_cid_nmse
+    higher_is_better: false
+    description: Aggregate range-normalized CID MSE across all six cases.
+  - name: case6_cate_mse
+    higher_is_better: false
+    description: Aggregate CATE MSE across all six structured cases.
+  - name: case6_cate_nmse
+    higher_is_better: false
+    description: Aggregate range-normalized CATE MSE across all six cases.
+  - name: case6_ate_error
+    higher_is_better: false
+    description: Aggregate ATE error across all six structured cases.
+  - name: case6_picp_90
+    higher_is_better: false
+    description: Aggregate central 90-percent interval coverage across all six cases.
+  - name: case6_picp_90_gap
+    higher_is_better: false
+    description: Absolute distance of aggregate structured-case PICP from 0.90.
 baselines:
   - name: naive (per-task ridge)
     score: 0
     source: fitted_per_task
-  - name: oracle (MC CATE)
+  - name: oracle (SCM potential outcomes)
     score: 0
-    source: monte_carlo
+    source: monte_carlo_and_paired_counterfactuals
 citations:
   - robertson2025dopfn
