@@ -115,6 +115,66 @@ def _make_handler(loader: Any) -> type[BaseHTTPRequestHandler]:
     return _Handler
 
 
+class _AdapterServeLoader:
+    """Warm, adapter-backed serve loader. Resolves the run's adapter, loads its
+    model ONCE, and answers per request through ``adapter.predict()`` /
+    ``adapter.capabilities()`` — the persistent analogue of
+    ``predict._run_adapter_inference`` (which loads per call). This is what makes
+    ``pfnstudio serve`` work for adapter base models (TCPFN, …); the default
+    ``ModelLoader`` only understands the studio block model and rejects the
+    ``{task, inputs}`` envelope with ``invalid_payload``. Exposes ``predict``
+    with the same ``(payload, tag, detect)`` signature the handler calls."""
+
+    def __init__(
+        self,
+        adapter_name: str,
+        manifest_path: Path,
+        project_root: Path,
+        checkpoint_dir: Path,
+    ) -> None:
+        import torch
+        import yaml
+
+        from ..registry import discover_in_project
+        from ..training.adapters import resolve_adapter
+
+        self._name = adapter_name
+        discover_in_project(project_root)
+        try:
+            data = yaml.safe_load(Path(manifest_path).read_text(encoding="utf-8")) or {}
+        except Exception:  # noqa: BLE001
+            data = {}
+        hp = (data.get("hyperparams") or {}) if isinstance(data, dict) else {}
+        self._hp: dict[str, Any] = hp if isinstance(hp, dict) else {}
+        self._adapter = resolve_adapter(adapter_name, self._hp.get("adapterModule"))
+        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._model = self._adapter.load_model(Path(checkpoint_dir), self._hp, self._device)
+        if hasattr(self._model, "eval"):
+            self._model.eval()
+
+    def predict(self, payload: dict, tag: Any = None, detect: bool = False) -> dict:
+        import torch
+
+        if isinstance(payload, dict) and payload.get("__capabilities__"):
+            cap_fn = getattr(self._adapter, "capabilities", None)
+            caps = cap_fn() if callable(cap_fn) else {}
+            return {
+                "engine": self._name,
+                "command": "capabilities",
+                "result": {"capabilities": caps or {}},
+            }
+        predict_fn = getattr(self._adapter, "predict", None)
+        if predict_fn is None:
+            return {
+                "engine": self._name,
+                "command": "predict",
+                "result": {"error": f"the '{self._name}' adapter does not implement predict()."},
+            }
+        with torch.no_grad():
+            result = predict_fn(self._model, payload or {}, self._hp, self._device)
+        return {"engine": self._name, "command": "predict", "result": result}
+
+
 def serve(
     *,
     manifest_path: Path,
@@ -133,16 +193,25 @@ def serve(
     construction is emitted as a load-stage error event with exit 1
     so the parent can surface the reason on the Deployment row.
     """
-    from ..training.predict import ModelLoader
+    from ..training.predict import ModelLoader, _peek_run_adapter
 
     _emit("starting", host=host, port=port, run_dir=str(project_root))
 
     try:
-        loader = ModelLoader(
-            manifest_path=manifest_path,
-            project_root=project_root,
-            checkpoint_dir=checkpoint_dir,
-        )
+        adapter_name = _peek_run_adapter(manifest_path)
+        if adapter_name:
+            # Adapter base model (TCPFN, …): serve through the adapter's own
+            # predict()/capabilities(), not the block-model ModelLoader (which
+            # 400s 'invalid_payload' on the {task, inputs} envelope).
+            loader = _AdapterServeLoader(
+                adapter_name, manifest_path, project_root, checkpoint_dir
+            )
+        else:
+            loader = ModelLoader(
+                manifest_path=manifest_path,
+                project_root=project_root,
+                checkpoint_dir=checkpoint_dir,
+            )
     except BaseException as e:
         traceback.print_exc(file=sys.stderr)
         _emit("error", stage="load", message=f"{type(e).__name__}: {e}")

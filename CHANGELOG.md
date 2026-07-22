@@ -2,6 +2,16 @@
 
 Versions are per-package; tags are `core-v<version>` and `cli-v<version>`.
 
+## pfnstudio-core 0.9.5 (core)
+
+### Fixed
+- **`pfnstudio serve` now works for adapter base models.** The serve worker
+  only built the studio block-model `ModelLoader`, so a `{task, inputs}`
+  request to a served TCPFN/adapter model 400'd with `invalid_payload`. It now
+  detects a run's adapter and serves through the adapter's own
+  `predict()` / `capabilities()` (loaded once, warm), matching the CLI/predict
+  path. Fixes runner-served (and local-worker) endpoints for adapter models.
+
 ## pfnstudio-core 0.9.4 (core)
 
 ### Added

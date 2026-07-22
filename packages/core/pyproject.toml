@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pfnstudio-core"
-version = "0.9.4"
+version = "0.9.5"
 description = "Core abstractions for PFN Studio — Prior, Model, Eval, Run, and the block registry."
 readme = "README.md"
 requires-python = ">=3.10"
