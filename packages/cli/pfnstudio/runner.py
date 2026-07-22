@@ -277,7 +277,11 @@ def _persist_checkpoint(
     # run.yaml is also stashed at the runs/<slug>.yaml path the serve
     # CLI's project-auto-detect logic expects (parent.parent of the
     # manifest when its parent is named 'runs').
-    for sub in ("priors", "models", "evals", "runs"):
+    # adapters/ + blocks/ matter for serving too: an adapter base model (TCPFN,
+    # …) serves through adapters/<slug>.py — discover_in_project must find it in
+    # the persisted run dir, or serve fails at load with
+    # "No module named 'pfnstudio_core.training.adapters.<name>'".
+    for sub in ("priors", "models", "evals", "runs", "adapters", "blocks"):
         src = bundle_dir / sub
         if not src.is_dir():
             continue

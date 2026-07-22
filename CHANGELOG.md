@@ -24,6 +24,16 @@ Versions are per-package; tags are `core-v<version>` and `cli-v<version>`.
   base run's `baseAdapter`). `discover_in_project` now also imports
   `adapters/<name>.py`, so a per-project adapter self-registers at run time.
 
+## pfnstudio 0.8.18 (CLI)
+
+### Fixed
+- **Runner-served adapter models now serve.** `_persist_checkpoint` saved
+  `priors/ models/ evals/ runs/` alongside the checkpoint but not `adapters/`,
+  so `pfnstudio serve` on the runner couldn't find the model's adapter and
+  failed at load with `No module named 'pfnstudio_core.training.adapters.<name>'`.
+  It now also persists `adapters/` (and `blocks/`), so `discover_in_project`
+  registers the adapter for serving. Needs `pfnstudio-core>=0.9.5`.
+
 ## pfnstudio 0.8.17 (CLI)
 
 ### Added
