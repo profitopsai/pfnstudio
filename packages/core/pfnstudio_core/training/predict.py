@@ -306,12 +306,130 @@ def run_inference(
     worker, which holds one checkpoint in memory across many predict
     requests) instantiate :class:`ModelLoader` directly and reuse it.
     """
+    # Adapter dispatch: a run that continued-pretrained an external base model
+    # (hyperparams.adapter, or baseAdapter on the installed base run) predicts
+    # through THAT model's own architecture + real weights, not the studio
+    # block model. Generic — one branch for every adapter. Also answers the
+    # __capabilities__ manifest cheaply, before any weights load.
+    adapter_name = _peek_run_adapter(manifest_path)
+    if adapter_name:
+        return _run_adapter_inference(
+            adapter_name=adapter_name,
+            manifest_path=manifest_path,
+            project_root=project_root,
+            checkpoint_dir=checkpoint_dir,
+            payload=payload,
+        )
+
     with ModelLoader(
         manifest_path=manifest_path,
         project_root=project_root,
         checkpoint_dir=checkpoint_dir,
     ) as loader:
         return loader.predict(payload, tag=tag, detect=detect)
+
+
+def _peek_run_adapter(manifest_path: Path) -> str | None:
+    """Read the run YAML's `hyperparams.adapter` (continued-pretrain run) or
+    `baseAdapter` (the installed base run). Returns the adapter name to route
+    inference through its own architecture, or None for a studio-model run.
+    YAML-only — no project bootstrap, no RunSpec validation (base runs have
+    empty prior/model refs and would fail it)."""
+    try:
+        import yaml
+        data = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
+    except Exception:  # noqa: BLE001 — any read/parse issue → not an adapter run
+        return None
+    if not isinstance(data, dict):
+        return None
+    hp = data.get("hyperparams") or {}
+    if not isinstance(hp, dict):
+        return None
+    name = hp.get("adapter") or hp.get("baseAdapter")
+    return str(name) if isinstance(name, str) and name else None
+
+
+def _run_adapter_inference(
+    *,
+    adapter_name: str,
+    manifest_path: Path,
+    project_root: Path,
+    checkpoint_dir: Path,
+    payload: dict,
+) -> dict:
+    """Predict through a base model's OWN architecture + real weights.
+
+    Discovers the project's `adapters/<slug>.py`, resolves the adapter, loads
+    the real checkpoint (the same `load_model` continued-pretraining uses), and
+    calls the adapter's `predict()`. For a base model with no user data, the
+    adapter samples a task from the model's own prior and returns predicted-vs-
+    ground-truth — which both uses the real weights AND shows they work.
+    """
+    import torch
+    import yaml
+
+    from pfnstudio_core.registry import discover_in_project
+    from pfnstudio_core.training.adapters import resolve_adapter
+
+    discover_in_project(project_root)
+    try:
+        data = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
+    except Exception:  # noqa: BLE001
+        data = {}
+    hp = (data.get("hyperparams") or {}) if isinstance(data, dict) else {}
+    if not isinstance(hp, dict):
+        hp = {}
+
+    try:
+        adapter = resolve_adapter(adapter_name, hp.get("adapterModule"))
+    except Exception as e:  # noqa: BLE001
+        return {
+            "engine": adapter_name,
+            "command": "predict",
+            "result": {"error": f"the '{adapter_name}' adapter is not available ({type(e).__name__}: {e})."},
+        }
+
+    # Capability manifest — static, weights not needed. Answered BEFORE the
+    # (expensive) model load so the Try-it / Inference surfaces can fetch the
+    # task schema cheaply. Adapters without capabilities() report {}.
+    if isinstance(payload, dict) and payload.get("__capabilities__"):
+        cap_fn = getattr(adapter, "capabilities", None)
+        try:
+            caps = cap_fn() if callable(cap_fn) else {}
+        except Exception as e:  # noqa: BLE001
+            return {
+                "engine": adapter_name,
+                "command": "capabilities",
+                "result": {"error": f"capabilities() failed — {type(e).__name__}: {e}"},
+            }
+        return {
+            "engine": adapter_name,
+            "command": "capabilities",
+            "result": {"capabilities": caps or {}},
+        }
+
+    predict_fn = getattr(adapter, "predict", None)
+    if predict_fn is None:
+        return {
+            "engine": adapter_name,
+            "command": "predict",
+            "result": {"error": f"the '{adapter_name}' adapter does not implement predict() yet."},
+        }
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        model = adapter.load_model(Path(checkpoint_dir), hp, device)
+        model.eval()
+        with torch.no_grad():
+            result = predict_fn(model, payload or {}, hp, device)
+    except Exception as e:  # noqa: BLE001 — surface as a structured error, not a crash
+        return {
+            "engine": adapter_name,
+            "command": "predict",
+            "result": {"error": f"the '{adapter_name}' adapter failed during inference — {type(e).__name__}: {e}"},
+        }
+
+    return {"engine": adapter_name, "command": "predict", "result": result}
 
 
 def _run_detector(

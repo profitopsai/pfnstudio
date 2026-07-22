@@ -54,6 +54,27 @@ class LocalAdapter(ComputeAdapter):
 
             run = load_run(run_yaml)
 
+            # ── Adapter dispatch ─────────────────────────────────────────
+            # A run may train through a FOREIGN base model's own architecture +
+            # loss (continued-pretraining an external model like TCPFN) instead
+            # of the studio's block-composed model. This is the single generic
+            # branch — each model is a registered adapter, never a per-model
+            # branch here. No `hyperparams.adapter` = the native path below.
+            # `discover_in_project` above already imported any project-local
+            # adapters/<name>.py, so their @register_adapter has fired.
+            adapter_name = (run.hyperparams or {}).get("adapter")
+            if adapter_name:
+                from pfnstudio_core.training.adapters import run_adapter_training
+
+                return run_adapter_training(
+                    adapter_name=str(adapter_name),
+                    adapter_module=(run.hyperparams or {}).get("adapterModule"),
+                    run=run,
+                    workspace_dir=project_root,
+                    emit_event=_emit_event,
+                    emit_log=_emit_log,
+                )
+
             prior_yaml = project_root / "priors" / run.prior.id / "prior.yaml"
             if not prior_yaml.exists():
                 return {"status": "error", "reason": f"prior.yaml not found at {prior_yaml}"}

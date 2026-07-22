@@ -2,7 +2,35 @@
 
 Versions are per-package; tags are `core-v<version>` and `cli-v<version>`.
 
+## pfnstudio-core 0.9.4 (core)
+
+### Added
+- **Model adapter subsystem** — the plug-in seam for continued-pretraining
+  external base models (TCPFN, Do-PFN, …) through their OWN architecture + loss
+  instead of the studio's block-composed model. Adds `@register_adapter` /
+  `get_adapter` / `resolve_adapter`, the generic `run_adapter_training` loop,
+  and the `Adapter` protocol. Inference routes through the adapter's
+  `predict()` / `capabilities()` when a run carries `hyperparams.adapter` (or a
+  base run's `baseAdapter`). `discover_in_project` now also imports
+  `adapters/<name>.py`, so a per-project adapter self-registers at run time.
+
+## pfnstudio 0.8.17 (CLI)
+
+### Added
+- **Adapter training dispatch** — the `local` compute path now routes a run
+  with `hyperparams.adapter` to `run_adapter_training` (needs
+  `pfnstudio-core>=0.9.4`). Previously such a run fell through to block-model
+  training and skipped with `step_fn returned None` (0 steps, no checkpoint),
+  because core had no adapter concept.
+
 ## pfnstudio 0.8.16 (CLI)
+
+### Changed
+- **Renamed `templates/` → `starters/`.** The directory `pfnstudio init` copies
+  is now `starters/fm-project`, clearly distinct from `studies/` (complete,
+  reproducible example projects). `init` behaviour is unchanged. Internal
+  helpers `templates_root()` / `fm_project_template()` are now
+  `starters_root()` / `fm_project_starter()`.
 
 ### Fixed
 - **`__version__` was a hardcoded literal stuck at 0.8.12.** It was never

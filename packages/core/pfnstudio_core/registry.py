@@ -1,4 +1,6 @@
-"""Decorator-based registries for priors, architecture blocks, and scorers."""
+"""Decorator-based registries for priors, architecture blocks, scorers, and
+model adapters (the plug-in seam for continued-pretraining external base
+models like TCPFN through their OWN architecture + loss)."""
 
 from __future__ import annotations
 
@@ -10,6 +12,7 @@ T = TypeVar("T")
 _PRIORS: dict[str, type] = {}
 _BLOCKS: dict[str, type] = {}
 _SCORERS: dict[str, type] = {}
+_ADAPTERS: dict[str, type] = {}
 
 
 def _register(table: dict[str, type], name: str) -> Callable[[type[T]], type[T]]:
@@ -42,6 +45,18 @@ def register_scorer(name: str) -> Callable[[type[T]], type[T]]:
     return _register(_SCORERS, name)
 
 
+def register_adapter(name: str) -> Callable[[type[T]], type[T]]:
+    """Register a model Adapter so a run's `hyperparams.adapter` resolves to it.
+
+    An adapter is the plug-in seam for continued-pretraining an EXTERNAL base
+    model through its own architecture + loss (instead of the studio's
+    block-composed model). Ship it as `adapters/<name>.py` with
+    `@register_adapter("<name>")` — `discover_in_project` imports it at run time
+    — or in the model's own installed package.
+    """
+    return _register(_ADAPTERS, name)
+
+
 def get_prior(name: str) -> type:
     # Loose match: tolerate `-` ↔ `_` swaps. The DB slugifier converts `_` to
     # `-` (URL-safe), but Python decorators register with idiomatic snake_case.
@@ -71,6 +86,15 @@ def get_scorer(name: str) -> type:
     raise KeyError(f"No scorer registered under '{name}'. Available: {sorted(_SCORERS)}")
 
 
+def get_adapter(name: str) -> type:
+    # Tolerate `-` ↔ `_` swaps, same as get_prior: the DB slugifier uses `-`
+    # but decorators register idiomatic snake_case.
+    for candidate in (name, name.replace("-", "_"), name.replace("_", "-")):
+        if candidate in _ADAPTERS:
+            return _ADAPTERS[candidate]
+    raise KeyError(f"No adapter registered under '{name}'. Available: {sorted(_ADAPTERS)}")
+
+
 def list_priors() -> list[str]:
     return sorted(_PRIORS)
 
@@ -83,15 +107,20 @@ def list_scorers() -> list[str]:
     return sorted(_SCORERS)
 
 
+def list_adapters() -> list[str]:
+    return sorted(_ADAPTERS)
+
+
 def _clear_for_tests() -> None:
     _PRIORS.clear()
     _BLOCKS.clear()
     _SCORERS.clear()
+    _ADAPTERS.clear()
 
 
 def discover_in_project(project_root: Any) -> None:
-    """Import every Python module under priors/, evals/, models/ and blocks/
-    so decorators register (priors, scorers, blocks).
+    """Import every Python module under priors/, evals/, models/, blocks/ and
+    adapters/ so decorators register (priors, scorers, blocks, adapters).
 
     project_root: pathlib.Path — typed loosely to avoid an import cycle.
     """
@@ -99,7 +128,7 @@ def discover_in_project(project_root: Any) -> None:
     from pathlib import Path
 
     root = Path(project_root)
-    for sub in ("priors", "evals", "models", "blocks"):
+    for sub in ("priors", "evals", "models", "blocks", "adapters"):
         d = root / sub
         if not d.exists():
             continue
