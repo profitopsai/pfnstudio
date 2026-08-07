@@ -147,6 +147,10 @@ class ModelLoader:
 
         # Same project bootstrap as the local trainer adapter.
         self._project_root_str: str | None = str(project_root)
+        # Kept for native schema-driven execution ({task, inputs}) + the
+        # capabilities ping: both read the declarative model/prior manifest.
+        self._manifest_path: Path = manifest_path
+        self._project_root: Path = project_root
         sys.path.insert(0, self._project_root_str)
 
         # If anything below raises, restore sys.path before propagating —
@@ -240,6 +244,22 @@ class ModelLoader:
         command, the ``/runs/:id/predict`` endpoint, the forthcoming
         worker process) wrap into their preferred error envelope.
         """
+        # Native capabilities ping — a cheap manifest read from the model/prior
+        # YAML that never touches the weights. Lets a NATIVE studio model (no
+        # adapter) self-describe its Try-it/Inference contract, same as the
+        # adapter path does.
+        if isinstance(payload, dict) and payload.get("__capabilities__"):
+            return _native_capabilities(
+                manifest_path=self._manifest_path, project_root=self._project_root
+            )
+
+        # Native schema-driven task ({task, inputs}) — the envelope the Try-it /
+        # Inference surfaces post. Handled here so BOTH the CLI run_inference
+        # path and the runner's serve handler execute custom tasks (e.g. RCA)
+        # identically. The legacy raw {context,query}/{X} payloads fall through.
+        if isinstance(payload, dict) and payload.get("task") and "inputs" in payload:
+            return self._predict_native_task(payload)
+
         if self.d_in is not None:
             _validate_input_dim(payload, self.d_in)
 
@@ -271,6 +291,85 @@ class ModelLoader:
                 out["detect_warning"] = f"{type(e).__name__}: {e}"
 
         return out
+
+    def _predict_native_task(self, payload: dict) -> dict:
+        """Execute a schema-driven {task, inputs} predict against this loaded
+        native studio model.
+
+        Resolves the declared task spec from the model/prior capabilities
+        manifest, asks the run's prior to pack `inputs` into the model tensor
+        (``prior.pack_inference`` — the model-specific bit stays project-owned),
+        runs the encoder→head forward, and shapes the head output per the
+        task's ``output_schema.kind``. Returns the raw result dict (or
+        ``{"error": ...}``); never raises for user-data problems so both the
+        CLI and the serve handler surface a clean message.
+        """
+        import numpy as np
+        import torch
+
+        from ..registry import get_prior
+
+        task = payload.get("task")
+        inputs = payload.get("inputs")
+        if not isinstance(task, str) or not task:
+            return {"error": "predict envelope is missing a 'task'."}
+        if not isinstance(inputs, dict):
+            return {"error": "predict envelope is missing an 'inputs' object."}
+
+        caps = _resolve_native_manifest(self._manifest_path, self._project_root)
+        spec = caps.get(task) if isinstance(caps, dict) else None
+        if not isinstance(spec, dict):
+            avail = sorted(caps) if isinstance(caps, dict) else []
+            return {"error": f"this model declares no task '{task}'. Available: {avail}."}
+
+        try:
+            prior_cls = get_prior(self.run.prior.id)
+        except KeyError:
+            return {"error": "the run's prior isn't available, so native inference can't pack its input."}
+        packer = getattr(prior_cls(), "pack_inference", None)
+        if not callable(packer):
+            return {
+                "error": (
+                    f"the '{self.run.prior.id}' prior declares no pack_inference(), so the "
+                    f"'{task}' task can't run natively. Add pack_inference() to the prior, or "
+                    "serve this model through an adapter."
+                )
+            }
+
+        # The model's trained node capacity (the encoder asserts cols ==
+        # 3*k_max); read it off the loaded model so the packer can't drift
+        # from the weights. Fall back to d_in/3.
+        k_max = next(
+            (int(getattr(m, "k_max")) for _, m in getattr(self.model, "modules", []) if hasattr(m, "k_max")),
+            None,
+        )
+        if k_max is None and self.d_in:
+            k_max = int(self.d_in) // 3
+
+        try:
+            packed = packer(task=task, inputs=inputs, k_max=k_max, spec=spec)
+        except Exception as e:  # noqa: BLE001 — user-data shape errors are expected
+            return {"error": f"couldn't build the model input for '{task}' — {type(e).__name__}: {e}."}
+
+        X = np.asarray(packed["X"], dtype=np.float32)
+        sep = int(packed.get("single_eval_pos") or 0)
+        node_names = list(packed.get("node_names") or [])
+
+        xt = torch.from_numpy(X).float()
+        if xt.dim() == 2:
+            xt = xt.unsqueeze(0)
+        with torch.no_grad():
+            head_out = _forward_encoder_and_pick_head(
+                self.model, xt, (), single_eval_pos=sep
+            )
+            if head_out is None:
+                return {"error": "the model produced no head output for this task."}
+            to_pred = _head_to_prediction(self.model)
+            pred = to_pred(head_out) if to_pred else head_out
+
+        result = _shape_native_output(spec, pred, node_names)
+        result["task"] = task
+        return result
 
     def close(self) -> None:
         """Remove this loader's project root from ``sys.path``. Idempotent —
@@ -599,7 +698,11 @@ def _validate_input_dim(payload: dict, expected: int) -> None:
 
 
 def _forward_encoder_and_pick_head(
-    model: Any, x: Any, expected_shape_tail: tuple, tag_tensor: Any = None
+    model: Any,
+    x: Any,
+    expected_shape_tail: tuple,
+    tag_tensor: Any = None,
+    single_eval_pos: int | None = None,
 ) -> Any:
     """Run the model's encoder blocks once, then run each head block
     in parallel on the encoder output and return the first head whose
@@ -627,10 +730,19 @@ def _forward_encoder_and_pick_head(
     batch_tag = _tile_tag_to_batch(tag_tensor, x)
     enc_out = x
     for mod in encoder:
+        kwargs: dict[str, Any] = {}
         if batch_tag is not None and getattr(mod, "tag_embedder", None) is not None:
-            enc_out = mod(enc_out, tag=batch_tag)
-        else:
-            enc_out = mod(enc_out)
+            kwargs["tag"] = batch_tag
+        # n_ctx-aware blocks (e.g. mace_delta_pool, grid_preprocessor) receive
+        # the context/query boundary — same dispatch the training loop uses.
+        if (
+            single_eval_pos is not None
+            and single_eval_pos > 0
+            and getattr(mod, "needs_single_eval_pos", False)
+        ):
+            kwargs["single_eval_pos"] = single_eval_pos
+        result = mod(enc_out, **kwargs) if kwargs else mod(enc_out)
+        enc_out = result[0] if isinstance(result, tuple) else result
     head_outputs = [head(enc_out) for head in heads] if heads else [enc_out]
     if not expected_shape_tail:
         return head_outputs[0] if head_outputs else None
@@ -749,6 +861,134 @@ def _forward_full_sequence(
         if ho.dim() >= 3 and ho.shape[-1] == 1:
             return ho
     return head_outputs[0] if head_outputs else None
+
+
+def _read_declared_capabilities(yaml_path: Path) -> dict:
+    """Read a `capabilities:` manifest from a model.yaml / prior.yaml, YAML-only.
+
+    Returns {} when the file is missing, unparseable, or declares no manifest.
+    Deliberately does NOT go through load_model / load_prior (which require the
+    project importable + blocks resolvable) — a capabilities ping must stay
+    cheap and must never depend on the checkpoint, which may live on a remote
+    runner. Same philosophy as the `_peek_*` helpers above.
+    """
+    import yaml
+
+    try:
+        data = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
+    except Exception:  # noqa: BLE001 — any read/parse issue → no manifest
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    caps = data.get("capabilities")
+    return caps if isinstance(caps, dict) else {}
+
+
+def _resolve_native_manifest(manifest_path: Path, project_root: Path) -> dict:
+    """The declared capabilities manifest for a native studio-model run.
+
+    The model's `capabilities:` wins; the prior's is the fallback, so a prior
+    can own the task schema for the data shape it produces. Returns {} when
+    neither declares one. Shared by the capabilities ping and native execution
+    so both read the SAME manifest.
+    """
+    import yaml
+
+    try:
+        run_yaml = yaml.safe_load(Path(manifest_path).read_text(encoding="utf-8")) or {}
+    except Exception:  # noqa: BLE001
+        run_yaml = {}
+
+    def _ref_id(key: str) -> str | None:
+        ref = run_yaml.get(key) if isinstance(run_yaml, dict) else None
+        rid = ref.get("id") if isinstance(ref, dict) else None
+        return rid if isinstance(rid, str) and rid else None
+
+    caps: dict = {}
+    model_id = _ref_id("model")
+    if model_id:
+        caps = _read_declared_capabilities(project_root / "models" / f"{model_id}.yaml")
+    if not caps:
+        prior_id = _ref_id("prior")
+        if prior_id:
+            caps = _read_declared_capabilities(
+                project_root / "priors" / prior_id / "prior.yaml"
+            )
+    return caps if isinstance(caps, dict) else {}
+
+
+def _native_capabilities(*, manifest_path: Path, project_root: Path) -> dict:
+    """Answer the capability manifest for a native studio-model run (no adapter)
+    from its declarative model/prior YAML — no weights, no adapter. Returns the
+    generic capabilities envelope every Try-it surface understands; an empty
+    manifest simply leaves the host on its legacy form.
+    """
+    caps = _resolve_native_manifest(manifest_path, project_root)
+    return {
+        "engine": "pfnstudio",
+        "command": "capabilities",
+        "result": {"capabilities": caps or {}},
+    }
+
+
+def _shape_native_output(spec: dict, pred: Any, node_names: list) -> dict:
+    """Project a native model's head output into the result shape declared by
+    the task's `output_schema.kind`. Currently handles `ranked_list` (the shape
+    the schema-Try-it's bar renderer expects); anything else returns the raw
+    array so the caller can still inspect it.
+    """
+    import numpy as np
+    import torch
+
+    os_ = spec.get("output_schema") if isinstance(spec, dict) else None
+    os_ = os_ if isinstance(os_, dict) else {}
+    kind = os_.get("kind")
+
+    arr = pred.detach().cpu().numpy() if torch.is_tensor(pred) else np.asarray(pred)
+
+    if kind == "ranked_list":
+        # Head output is (B, R, K) (per-row, all rows identical for a broadcast
+        # per-episode answer) or (B, K). Read batch 0's last (query) row.
+        a = arr[0] if arr.ndim >= 2 else arr
+        row = a[-1] if a.ndim == 2 else a  # (K,)
+        field = os_.get("field", "root_causes")
+        name_key = os_.get("label_field", "variable")
+        score_key = os_.get("score_field", "score")
+        limit = int(row.shape[-1])
+        n = min(len(node_names), limit) if node_names else limit
+        items = [
+            {
+                name_key: (node_names[i] if i < len(node_names) else f"x{i + 1}"),
+                score_key: float(row[i]),
+            }
+            for i in range(n)
+        ]
+        items.sort(key=lambda d: -d[score_key])
+        return {field: items}
+
+    if kind in ("classification", "class_probabilities", "probabilities"):
+        # Honor a DECLARED classification task: shape the head output into
+        # class probabilities instead of letting it fall through to a raw /
+        # regression-looking array. Binary (scalar head → 1 logit/row) →
+        # sigmoid; multi-class (K>1 logits) → softmax over the class axis.
+        a = arr[0] if arr.ndim >= 2 else arr  # drop batch → (R, K) or (R,)
+        if a.ndim == 1:
+            a = a.reshape(-1, 1)
+        field = os_.get("field", "predictions")
+        if a.shape[-1] == 1:
+            p1 = 1.0 / (1.0 + np.exp(-a[:, 0]))
+            return {
+                field: [int(p >= 0.5) for p in p1],
+                "probabilities": [[float(1.0 - p), float(p)] for p in p1],
+            }
+        e = np.exp(a - a.max(axis=-1, keepdims=True))
+        sm = e / e.sum(axis=-1, keepdims=True)
+        return {
+            field: [int(row.argmax()) for row in sm],
+            "probabilities": [[float(v) for v in row] for row in sm],
+        }
+
+    return {"raw": arr.tolist()}
 
 
 def _dispatch_inference(
