@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pfnstudio"
-version = "0.8.16"
+version = "0.8.18"
 description = "CLI for the PFN Studio framework — scaffold, validate, lint, and run prior-fitted foundation model projects."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,7 +23,7 @@ dependencies = [
   "pyyaml>=6.0",
   "jsonschema>=4.21",
   "requests>=2.31",
-  "pfnstudio-core>=0.9.0",
+  "pfnstudio-core>=0.9.5",
 ]
 
 [project.optional-dependencies]
@@ -64,7 +64,7 @@ Documentation = "https://github.com/profitopsai/pfnstudio/tree/main/docs"
 [tool.hatch.build.targets.wheel]
 packages = ["pfnstudio"]
 # _bundled/ is populated by scripts/sync-bundled.sh before build —
-# schemas/ and templates/ live at the repo root for development and
+# schemas/ and starters/ live at the repo root for development and
 # get copied in for packaging. The build no longer reaches outside
 # the package dir (which is rejected by `python -m build` isolation
 # and Python 3.13's stricter tarfile filter).
