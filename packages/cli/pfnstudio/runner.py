@@ -61,6 +61,7 @@ Still out of scope:
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import math
@@ -230,6 +231,32 @@ def _update_state(**fields: Any) -> None:
         pass
 
 
+def _job_fingerprint(job: dict[str, Any]) -> str:
+    """Identity of what is being trained, for deciding whether an existing
+    checkpoint may be resumed from.
+
+    Covers the prior, the model and the hyperparameters — but deliberately NOT
+    `steps`/`epochs`: raising the step count to train longer is exactly the edit
+    where you want to continue from where you left off. Change the architecture
+    or the prior and the fingerprint moves, so the stale snapshots are cleared
+    and the run starts clean instead of resuming into weights that no longer
+    mean the same thing.
+    """
+    hp = dict(job.get("hyperparams") or {})
+    hp.pop("steps", None)
+    hp.pop("epochs", None)
+    payload = json.dumps(
+        {
+            "prior": job.get("priorRef"),
+            "model": job.get("modelRef"),
+            "hyperparams": hp,
+        },
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()[:32]
+
+
 def _persist_checkpoint(
     bundle_dir: Path, run_id: str, run_slug: str, cloud_url: str
 ) -> tuple[Path, int] | None:
@@ -241,21 +268,32 @@ def _persist_checkpoint(
     Uses shutil.move so an existing local dir from a prior re-run gets
     cleanly replaced. A previous attempt's leftovers (rare — same runId
     re-running on the same box) would otherwise grow stale.
+
+    No-op when training already wrote to the durable directory (the normal
+    path now — the runner sets PFNSTUDIO_CHECKPOINT_DIR to dst_ckpt at spawn
+    time so mid-training snapshots survive); it just measures what's there.
+    The bundle-relative move remains for older trainers that don't honour the
+    env var.
     """
-    src = bundle_dir / "checkpoint"
-    if not src.is_dir():
-        return None
     dst_root = RUNS_ROOT / run_id
     dst_ckpt = dst_root / "checkpoint"
-    try:
-        RUNS_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if dst_ckpt.exists():
-            shutil.rmtree(dst_ckpt, ignore_errors=True)
-        dst_root.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(src), str(dst_ckpt))
-    except OSError as e:
-        console.print(f"[yellow]Could not persist checkpoint locally:[/yellow] {e}")
-        return None
+    src = bundle_dir / "checkpoint"
+
+    if not src.is_dir():
+        # Nothing in the workspace: either the trainer wrote straight to the
+        # durable dir (PFNSTUDIO_CHECKPOINT_DIR) or it produced no checkpoint.
+        if not dst_ckpt.is_dir():
+            return None
+    elif src.resolve() != dst_ckpt.resolve():
+        try:
+            RUNS_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if dst_ckpt.exists():
+                shutil.rmtree(dst_ckpt, ignore_errors=True)
+            dst_root.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dst_ckpt))
+        except OSError as e:
+            console.print(f"[yellow]Could not persist checkpoint locally:[/yellow] {e}")
+            return None
 
     size = 0
     for p in dst_ckpt.rglob("*"):
@@ -1716,6 +1754,80 @@ def _run_job(
         # JSON-line events on stdout, which we pipe up to /events.
         env = os.environ.copy()
         env["PFNSTUDIO_JSON_PROGRESS"] = "1"
+
+        # ── Resumable checkpoints ────────────────────────────────────────
+        # Point the trainer at a DURABLE per-run checkpoint dir (keyed by run
+        # id) instead of the disposable bundle, so its step snapshots outlive
+        # the workspace and the next attempt at this run resumes from them.
+        durable_ckpt = RUNS_ROOT / run_id / "checkpoint"
+        try:
+            durable_ckpt.mkdir(parents=True, exist_ok=True)
+            env["PFNSTUDIO_CHECKPOINT_DIR"] = str(durable_ckpt)
+
+            # Cross-box / cleaned-dir resume: if THIS box has no local snapshots
+            # but the cloud shipped resume_checkpoint/ in the bundle (this run's
+            # own snapshots, staged studio-side from a prior attempt), seed the
+            # durable dir from it so a fresh runner continues from the last step
+            # instead of restarting. Same-box re-runs already have the snapshots
+            # locally and skip this. The fingerprint check below still guards
+            # correctness.
+            if bundle_dir is not None and not list(durable_ckpt.glob("model_step_*.pt")):
+                bundle_resume = work_root / "resume_checkpoint"
+                staged_snaps = (
+                    sorted(bundle_resume.glob("model_step_*.pt"))
+                    if bundle_resume.is_dir()
+                    else []
+                )
+                if staged_snaps:
+                    try:
+                        for f in bundle_resume.iterdir():
+                            if f.is_file():
+                                shutil.copy2(str(f), str(durable_ckpt / f.name))
+                        console.print(
+                            f"[blue]→[/blue] seeded {len(staged_snaps)} checkpoint "
+                            f"snapshot(s) from the cloud bundle into {durable_ckpt}"
+                        )
+                    except OSError as e:
+                        console.print(
+                            f"[yellow]Could not seed resume checkpoint from bundle: {e}"
+                            "[/yellow]"
+                        )
+
+            # Resume only into the same experiment: snapshots left by an attempt
+            # with a different prior/model/hyperparams are cleared rather than
+            # resumed from — shapes can coincide, and continuing into weights
+            # that mean something else is worse than restarting.
+            fp_path = durable_ckpt / ".job-fingerprint"
+            fp_now = _job_fingerprint(job)
+            fp_prev = None
+            try:
+                fp_prev = fp_path.read_text().strip()
+            except OSError:
+                pass
+            snapshots = sorted(durable_ckpt.glob("model_step_*.pt"))
+            if fp_prev is not None and fp_prev != fp_now and snapshots:
+                console.print(
+                    "[yellow]Prior/model/hyperparams changed since the last "
+                    "attempt — discarding its checkpoints and starting from "
+                    "step 0.[/yellow]"
+                )
+                shutil.rmtree(durable_ckpt, ignore_errors=True)
+                durable_ckpt.mkdir(parents=True, exist_ok=True)
+            elif snapshots:
+                console.print(
+                    f"[blue]→[/blue] resuming from {len(snapshots)} local "
+                    f"checkpoint(s) in {durable_ckpt}"
+                )
+            try:
+                fp_path.write_text(fp_now)
+            except OSError:
+                pass
+        except OSError as e:
+            console.print(
+                f"[yellow]Could not create {durable_ckpt} ({e}) — checkpoints "
+                "will stay in the job workspace and be lost if it is cleaned up."
+                "[/yellow]"
+            )
 
         proc = subprocess.Popen(
             [

@@ -486,6 +486,123 @@ def train_pfn(
     optim = torch.optim.AdamW(params, lr=lr)
     step_fn = step_fn or _default_step
 
+    # ── Resumable checkpoints ────────────────────────────────────────────
+    # Step-tagged snapshots (weights + optimizer state) written every eval let
+    # a re-run continue where it left off instead of restarting. The runner
+    # points PFNSTUDIO_CHECKPOINT_DIR at a durable per-run dir so these outlive
+    # the disposable job workspace; without it they land in <cwd>/checkpoint.
+    import re as _re
+
+    _env_ckpt = os.environ.get("PFNSTUDIO_CHECKPOINT_DIR", "").strip()
+    ckpt_dir = _env_ckpt or os.path.join(os.getcwd(), "checkpoint")
+    _CKPT_KEEP = 2  # keep only the last N step-snapshots to bound disk usage
+    _recent_snap_steps: list[int] = []
+
+    def _flat_state_dict() -> tuple[dict[str, Any], int]:
+        """Flat state_dict keyed <block>.<param> (namespaced per submodule for
+        multi-module blocks) — the same keying the final checkpoint + inference
+        loader use, so snapshots and the final model bind identically."""
+        sd: dict[str, Any] = {}
+        n = 0
+        for name, mod in getattr(model, "modules", []):
+            named = _block_nn_named_modules(mod)
+            multi = len(named) > 1
+            for attr, sub in named:
+                prefix = f"{name}.{attr}." if (multi and attr) else f"{name}."
+                for k, v in sub.state_dict().items():
+                    sd[f"{prefix}{k}"] = v
+                    n += 1
+        return sd, n
+
+    def _save_snapshot(at_step: int) -> None:
+        """model_step_N + optim_step_N snapshot so a resume restores Adam's
+        moving averages, not just weights (a cold optimizer stalls training for
+        ~100 steps). Best-effort; rotates out snapshots beyond _CKPT_KEEP."""
+        try:
+            os.makedirs(ckpt_dir, exist_ok=True)
+            sd, n = _flat_state_dict()
+            if n == 0:
+                return
+            torch.save(sd, os.path.join(ckpt_dir, f"model_step_{at_step}.pt"))
+            torch.save(
+                optim.state_dict(), os.path.join(ckpt_dir, f"optim_step_{at_step}.pt")
+            )
+            _recent_snap_steps.append(at_step)
+            while len(_recent_snap_steps) > _CKPT_KEEP:
+                old = _recent_snap_steps.pop(0)
+                for p in (
+                    os.path.join(ckpt_dir, f"model_step_{old}.pt"),
+                    os.path.join(ckpt_dir, f"optim_step_{old}.pt"),
+                ):
+                    try:
+                        os.remove(p)
+                    except FileNotFoundError:
+                        pass
+            _emit("log", line=f"checkpoint snapshot at step {at_step} ({n} tensors)")
+        except Exception as e:  # pragma: no cover — defensive
+            _emit(
+                "log",
+                line=f"checkpoint snapshot failed at step {at_step}: {type(e).__name__}: {e}",
+            )
+
+    # Resume: pick the latest model_step_N that ALSO has optim_step_N (both
+    # halves required — resuming Adam without its state defeats the purpose).
+    # Disable with PFNSTUDIO_NO_RESUME=1. Any failure falls back to a clean
+    # start rather than killing the run.
+    start_step = 0
+    _no_resume = os.environ.get("PFNSTUDIO_NO_RESUME", "").strip()
+    if _no_resume in ("", "0", "false", "False") and os.path.isdir(ckpt_dir):
+        try:
+            _pat = _re.compile(r"^model_step_(\d+)\.pt$")
+            _cand = sorted(
+                int(m.group(1))
+                for f in os.listdir(ckpt_dir)
+                if (m := _pat.match(f))
+                and os.path.exists(os.path.join(ckpt_dir, f"optim_step_{m.group(1)}.pt"))
+            )
+            if _cand:
+                at = _cand[-1]
+                flat = torch.load(
+                    os.path.join(ckpt_dir, f"model_step_{at}.pt"), map_location=device
+                )
+                for name, mod in getattr(model, "modules", []):
+                    block_sd = {
+                        k[len(name) + 1 :]: v
+                        for k, v in flat.items()
+                        if k.startswith(name + ".")
+                    }
+                    if not block_sd:
+                        continue
+                    named = _block_nn_named_modules(mod)
+                    multi = len(named) > 1
+                    for attr, sub in named:
+                        if multi and attr:
+                            sub_sd = {
+                                k[len(attr) + 1 :]: v
+                                for k, v in block_sd.items()
+                                if k.startswith(attr + ".")
+                            }
+                        else:
+                            sub_sd = block_sd
+                        sub.load_state_dict(sub_sd, strict=False)
+                optim.load_state_dict(
+                    torch.load(
+                        os.path.join(ckpt_dir, f"optim_step_{at}.pt"), map_location=device
+                    )
+                )
+                _recent_snap_steps[:] = _cand[-_CKPT_KEEP:]
+                start_step = at
+                _emit(
+                    "log",
+                    line=f"resumed from checkpoint at step {at} ({steps - at} steps remaining)",
+                )
+        except Exception as e:  # noqa: BLE001 — never fail a run over a resume attempt
+            start_step = 0
+            _emit(
+                "log",
+                line=f"checkpoint resume failed, starting from step 0: {type(e).__name__}: {e}",
+            )
+
     # Generic pre-training setup hook. A block that must prepare before the
     # first forward pass — e.g. a bar-distribution head computing bucket
     # borders from the prior — exposes setup(*, prior, hp, device). Duck-typed
@@ -575,10 +692,10 @@ def train_pfn(
     # live scorecard can show "before training" → "after step N" → …
     # without a gap. Cheap to run; especially useful as a comparison
     # point when checking whether training is actually helping.
-    if eval_every > 0 and eval_fn is not None:
+    if eval_every > 0 and eval_fn is not None and start_step == 0:
         _emit_eval_cycle(0)
 
-    for step in range(steps):
+    for step in range(start_step, steps):
         # Disjoint seed range per step. The previous formula `seed=seed+step`
         # made consecutive steps share batch_size-1 seeds (sample_batch
         # iterates seed+0..seed+batch_size-1), so each task appeared in
@@ -630,6 +747,9 @@ def train_pfn(
             done = step + 1
             if done % eval_every == 0 and done < steps:
                 _emit_eval_cycle(done)
+                # Snapshot AFTER the eval so a resume picks up at the same
+                # point the scorecard last reported.
+                _save_snapshot(done)
 
     # Persist the trained model so /runs/:id/predict can load it.
     # Two files, both under <cwd>/checkpoint/:
@@ -645,7 +765,8 @@ def train_pfn(
         import json
         import os
 
-        ckpt_dir = os.path.join(os.getcwd(), "checkpoint")
+        # Same dir the snapshots + PFNSTUDIO_CHECKPOINT_DIR resolved to above,
+        # so the final model.pt lands next to the step snapshots.
         os.makedirs(ckpt_dir, exist_ok=True)
         # Save weights — flat dict keyed by "<block_name>.<param>"
         # so the inference loader knows which weights go where even
