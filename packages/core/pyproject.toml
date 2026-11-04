@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pfnstudio-core"
-version = "0.9.8"
+version = "0.9.9"
 description = "Core abstractions for PFN Studio — Prior, Model, Eval, Run, and the block registry."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -28,7 +28,6 @@ dependencies = [
   # pandas is used by tabular priors / evals for DataFrame manipulation.
   # Lighter than torch; bundling avoids "module not found" surprises mid-run.
   "pandas>=2.0",
-  "cryptography>=42.0",
 ]
 
 [project.optional-dependencies]

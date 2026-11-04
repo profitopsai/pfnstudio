@@ -9,6 +9,14 @@ the toolkit for training [prior-fitted foundation models](https://arxiv.org/abs/
 pip install pfnstudio
 ```
 
+Run a pretrained base model — `--install-deps` installs what it needs on the
+first run (PyTorch when missing, then the model's own packages):
+
+```bash
+pip install pfnstudio
+pfnstudio run cdfm-base --install-deps
+```
+
 For training (requires PyTorch):
 
 ```bash
@@ -32,6 +40,7 @@ local daemon that hosts the models:
 
 ```text
 pfnstudio run <slug>[:tag]      # pull, pin (lock.json + digest), load into the daemon, run its sample
+                                #   --install-deps: PyTorch + the model's packages, on first run
 pfnstudio pull <slug>[:tag]     # fetch the adapter bundle + checkpoint into the local store, no run
 pfnstudio ls                    # what is in the local store (slug, tag, digest, sizes, loaded?)
 pfnstudio ps                    # what the daemon has loaded right now
