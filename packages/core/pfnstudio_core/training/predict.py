@@ -143,12 +143,14 @@ class ModelLoader:
         from pfnstudio_core.model import Model
         from pfnstudio_core.registry import discover_in_project
 
+        from ..serving.device import resolve_serve_device
         from .loop import _model_tabular_d_in
 
-        # Same project bootstrap as the local trainer adapter.
+        self._device = resolve_serve_device()
         self._project_root_str: str | None = str(project_root)
-        # Kept for native schema-driven execution ({task, inputs}) + the
-        # capabilities ping: both read the declarative model/prior manifest.
+        # Kept for native schema-driven execution ({task, inputs}) in
+        # predict(): it resolves the capabilities manifest + the run's prior
+        # packer from these without re-plumbing them through every caller.
         self._manifest_path: Path = manifest_path
         self._project_root: Path = project_root
         sys.path.insert(0, self._project_root_str)
@@ -206,6 +208,7 @@ class ModelLoader:
                     # sub-module — supports blocks with multiple nn.Modules.
                     sub.load_state_dict(sub_sd, strict=False)
                     sub.eval()
+                    sub.to(self._device)
 
             # Tabular embedder width (packed-token d_in), not an
             # arbitrary encoder weight matrix — scanning the first 2-D
@@ -244,19 +247,11 @@ class ModelLoader:
         command, the ``/runs/:id/predict`` endpoint, the forthcoming
         worker process) wrap into their preferred error envelope.
         """
-        # Native capabilities ping — a cheap manifest read from the model/prior
-        # YAML that never touches the weights. Lets a NATIVE studio model (no
-        # adapter) self-describe its Try-it/Inference contract, same as the
-        # adapter path does.
-        if isinstance(payload, dict) and payload.get("__capabilities__"):
-            return _native_capabilities(
-                manifest_path=self._manifest_path, project_root=self._project_root
-            )
-
-        # Native schema-driven task ({task, inputs}) — the envelope the Try-it /
-        # Inference surfaces post. Handled here so BOTH the CLI run_inference
-        # path and the runner's serve handler execute custom tasks (e.g. RCA)
-        # identically. The legacy raw {context,query}/{X} payloads fall through.
+        # Native schema-driven task ({task, inputs}) — the envelope the
+        # Try-it / Inference surfaces post. Handled here so BOTH the CLI
+        # run_inference path and the runner's serve handler (both of which
+        # call this method) execute custom tasks (e.g. RCA) identically.
+        # The legacy raw {context,query}/{X} payloads fall through below.
         if isinstance(payload, dict) and payload.get("task") and "inputs" in payload:
             return self._predict_native_task(payload)
 
@@ -270,7 +265,11 @@ class ModelLoader:
         tag_tensor = _resolve_tag_tensor(self.run, tag)
 
         out = _dispatch_inference(
-            self.model, payload, expected_d_in=self.d_in, tag_tensor=tag_tensor
+            self.model,
+            payload,
+            expected_d_in=self.d_in,
+            tag_tensor=tag_tensor,
+            device=self._device,
         )
 
         # Auto-detector proposal — only if the caller asked for it
@@ -322,10 +321,24 @@ class ModelLoader:
             avail = sorted(caps) if isinstance(caps, dict) else []
             return {"error": f"this model declares no task '{task}'. Available: {avail}."}
 
+        # A caller may send `data_csv` instead of `rows` + `columns`. Expanded
+        # here — after the spec is resolved, so a missing column is reported
+        # against the columns this checkpoint actually scores.
+        from ..serving.csv_inputs import CsvInputError, expand_data_csv
+
+        try:
+            schema = spec.get("input_schema") if isinstance(spec, dict) else None
+            declared = (schema or {}).get("columns") if isinstance(schema, dict) else None
+            inputs = expand_data_csv(inputs, [str(c) for c in declared] if declared else None)
+        except CsvInputError as e:
+            return {"error": str(e)}
+
         try:
             prior_cls = get_prior(self.run.prior.id)
         except KeyError:
-            return {"error": "the run's prior isn't available, so native inference can't pack its input."}
+            return {
+                "error": "the run's prior isn't available, so native inference can't pack its input."
+            }
         packer = getattr(prior_cls(), "pack_inference", None)
         if not callable(packer):
             return {
@@ -340,7 +353,7 @@ class ModelLoader:
         # 3*k_max); read it off the loaded model so the packer can't drift
         # from the weights. Fall back to d_in/3.
         k_max = next(
-            (int(getattr(m, "k_max")) for _, m in getattr(self.model, "modules", []) if hasattr(m, "k_max")),
+            (int(m.k_max) for _, m in getattr(self.model, "modules", []) if hasattr(m, "k_max")),
             None,
         )
         if k_max is None and self.d_in:
@@ -348,20 +361,20 @@ class ModelLoader:
 
         try:
             packed = packer(task=task, inputs=inputs, k_max=k_max, spec=spec)
-        except Exception as e:  # noqa: BLE001 — user-data shape errors are expected
-            return {"error": f"couldn't build the model input for '{task}' — {type(e).__name__}: {e}."}
+        except Exception as e:
+            return {
+                "error": f"couldn't build the model input for '{task}' — {type(e).__name__}: {e}."
+            }
 
         X = np.asarray(packed["X"], dtype=np.float32)
         sep = int(packed.get("single_eval_pos") or 0)
         node_names = list(packed.get("node_names") or [])
 
-        xt = torch.from_numpy(X).float()
+        xt = torch.from_numpy(X).float().to(self._device)
         if xt.dim() == 2:
             xt = xt.unsqueeze(0)
         with torch.no_grad():
-            head_out = _forward_encoder_and_pick_head(
-                self.model, xt, (), single_eval_pos=sep
-            )
+            head_out = _forward_encoder_and_pick_head(self.model, xt, (), single_eval_pos=sep)
             if head_out is None:
                 return {"error": "the model produced no head output for this task."}
             to_pred = _head_to_prediction(self.model)
@@ -369,6 +382,18 @@ class ModelLoader:
 
         result = _shape_native_output(spec, pred, node_names)
         result["task"] = task
+        # A packer that GENERATED its input has to hand it back, or the scores
+        # are unreadable: "row 3 scored 0.78" means nothing when the caller
+        # never chose row 3. `emit` is that channel — an optional dict merged
+        # into the result, so a task can return the candidates it invented
+        # alongside their scores. Reserved keys are not overwritten; the
+        # model's own output wins over anything a packer wants to call the
+        # same thing.
+        emit = packed.get("emit")
+        if isinstance(emit, dict):
+            for k, v in emit.items():
+                if k not in result:
+                    result[k] = v
         return result
 
     def close(self) -> None:
@@ -405,11 +430,11 @@ def run_inference(
     worker, which holds one checkpoint in memory across many predict
     requests) instantiate :class:`ModelLoader` directly and reuse it.
     """
-    # Adapter dispatch: a run that continued-pretrained an external base model
-    # (hyperparams.adapter, or baseAdapter on the installed base run) predicts
-    # through THAT model's own architecture + real weights, not the studio
-    # block model. Generic — one branch for every adapter. Also answers the
-    # __capabilities__ manifest cheaply, before any weights load.
+    # Base-model adapter inference: when the run carries an `adapter`
+    # (a continued-pretrain run) or `baseAdapter` (the installed base run
+    # itself), predict THROUGH the base model's own architecture + real
+    # weights — not the studio block-model. This is what makes "install a
+    # base model → predict with it" load that model's actual weights.
     adapter_name = _peek_run_adapter(manifest_path)
     if adapter_name:
         return _run_adapter_inference(
@@ -420,6 +445,21 @@ def run_inference(
             payload=payload,
         )
 
+    # Native studio-model capabilities: a static, declarative manifest read
+    # from the model (or prior) YAML. Answered here — BEFORE constructing
+    # ModelLoader, which loads weights — so a run whose checkpoint lives on a
+    # remote runner (checkpointPath null on this host) still describes its
+    # tasks. Without this branch the __capabilities__ ping fell through to
+    # ModelLoader.predict, which has no manifest path, errored, and the Try-it
+    # silently dropped to the legacy form.
+    if isinstance(payload, dict) and payload.get("__capabilities__"):
+        return _native_capabilities(manifest_path=manifest_path, project_root=project_root)
+
+    # Native schema-driven execution ({task, inputs}) is handled INSIDE
+    # ModelLoader.predict, not here — that method is the single chokepoint
+    # shared by this CLI path AND the runner's `pfnstudio serve` handler
+    # (packages/core/pfnstudio_core/serving/worker.py), so a runner-held
+    # checkpoint's Try-it runs through exactly the same code.
     with ModelLoader(
         manifest_path=manifest_path,
         project_root=project_root,
@@ -432,12 +472,13 @@ def _peek_run_adapter(manifest_path: Path) -> str | None:
     """Read the run YAML's `hyperparams.adapter` (continued-pretrain run) or
     `baseAdapter` (the installed base run). Returns the adapter name to route
     inference through its own architecture, or None for a studio-model run.
-    YAML-only — no project bootstrap, no RunSpec validation (base runs have
-    empty prior/model refs and would fail it)."""
+    YAML-only — no project bootstrap, no RunSpec
+    validation (base runs have empty prior/model refs and would fail it)."""
     try:
         import yaml
+
         data = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
-    except Exception:  # noqa: BLE001 — any read/parse issue → not an adapter run
+    except Exception:
         return None
     if not isinstance(data, dict):
         return None
@@ -446,6 +487,180 @@ def _peek_run_adapter(manifest_path: Path) -> str | None:
         return None
     name = hp.get("adapter") or hp.get("baseAdapter")
     return str(name) if isinstance(name, str) and name else None
+
+
+def _read_declared_capabilities(yaml_path: Path) -> dict:
+    """Read a `capabilities:` manifest from a model.yaml / prior.yaml, YAML-only.
+
+    Returns {} when the file is missing, unparseable, or declares no manifest.
+    Deliberately does NOT go through load_model / load_prior (which require the
+    project importable + blocks resolvable) — a capabilities ping must stay
+    cheap and must never depend on the checkpoint, which may live on a remote
+    runner. Same philosophy as the `_peek_*` helpers above.
+    """
+    import yaml
+
+    try:
+        data = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    caps = data.get("capabilities")
+    return caps if isinstance(caps, dict) else {}
+
+
+def _resolve_native_manifest(manifest_path: Path, project_root: Path) -> dict:
+    """The declared capabilities manifest for a native studio-model run.
+
+    The model's `capabilities:` wins; the prior's is the fallback, so a prior
+    can own the task schema for the data shape it produces. Returns {} when
+    neither declares one. Shared by the capabilities ping and native execution
+    so both read the SAME manifest.
+    """
+    import yaml
+
+    try:
+        run_yaml = yaml.safe_load(Path(manifest_path).read_text(encoding="utf-8")) or {}
+    except Exception:
+        run_yaml = {}
+
+    def _ref_id(key: str) -> str | None:
+        ref = run_yaml.get(key) if isinstance(run_yaml, dict) else None
+        rid = ref.get("id") if isinstance(ref, dict) else None
+        return rid if isinstance(rid, str) and rid else None
+
+    caps: dict = {}
+    model_id = _ref_id("model")
+    if model_id:
+        caps = _read_declared_capabilities(project_root / "models" / f"{model_id}.yaml")
+    if not caps:
+        prior_id = _ref_id("prior")
+        if prior_id:
+            caps = _read_declared_capabilities(project_root / "priors" / prior_id / "prior.yaml")
+    return caps if isinstance(caps, dict) else {}
+
+
+def _native_capabilities(*, manifest_path: Path, project_root: Path) -> dict:
+    """Answer the capability manifest for a native studio-model run (no adapter)
+    from its declarative model/prior YAML — no weights, no adapter. Returns the
+    generic capabilities envelope every Try-it surface understands; an empty
+    manifest simply leaves the host on its legacy form.
+
+    Folds in samples exactly as the adapter path does. This used to return the
+    envelope straight from the YAML, which meant a project's uploaded
+    samples/*.json reached ADAPTER-backed models only: for a native model the
+    files were read by nobody, no `samples` list appeared, and — because
+    apply_samples never ran — not one issue was reported to say why. The
+    symptom was indistinguishable from the feature not being deployed.
+    """
+    from pfnstudio_core.serving.samples import apply_samples
+
+    caps = _resolve_native_manifest(manifest_path, project_root) or {}
+    sample_issues = apply_samples(caps, project_root)
+    result: dict[str, Any] = {"capabilities": caps}
+    if sample_issues:
+        result["sample_issues"] = sample_issues
+    return {
+        "engine": "pfnstudio",
+        "command": "capabilities",
+        "result": result,
+    }
+
+
+def _shape_native_output(spec: dict, pred: Any, node_names: list) -> dict:
+    """Project a native model's head output into the result shape declared by
+    the task's `output_schema.kind`. Currently handles `ranked_list` (the shape
+    the schema-Try-it's bar renderer expects); anything else returns the raw
+    array so the caller can still inspect it.
+    """
+    import numpy as np
+    import torch
+
+    os_ = spec.get("output_schema") if isinstance(spec, dict) else None
+    os_ = os_ if isinstance(os_, dict) else {}
+    kind = os_.get("kind")
+
+    arr = pred.detach().cpu().numpy() if torch.is_tensor(pred) else np.asarray(pred)
+
+    if kind == "ranked_list":
+        # Head output is (B, R, K) (per-row, all rows identical for a broadcast
+        # per-episode answer) or (B, K). Read batch 0's last (query) row.
+        a = arr[0] if arr.ndim >= 2 else arr
+        row = a[-1] if a.ndim == 2 else a  # (K,)
+        field = os_.get("field", "root_causes")
+        name_key = os_.get("label_field", "variable")
+        score_key = os_.get("score_field", "score")
+        limit = int(row.shape[-1])
+        n = min(len(node_names), limit) if node_names else limit
+        items = [
+            {
+                name_key: (node_names[i] if i < len(node_names) else f"x{i + 1}"),
+                score_key: float(row[i]),
+            }
+            for i in range(n)
+        ]
+        items.sort(key=lambda d: -d[score_key])
+        return {field: items}
+
+    if kind in ("classification", "class_probabilities", "probabilities"):
+        # Honor a DECLARED classification task: shape the head output into
+        # class probabilities instead of letting it fall through to a raw /
+        # regression-looking array. Binary (scalar head → 1 logit/row) →
+        # sigmoid; multi-class (K>1 logits) → softmax over the class axis.
+        # This is what makes `output_schema.kind: "classification"` actually
+        # mean something — previously classification and regression models
+        # produced identical scalar output and the declaration was ignored.
+        a = arr[0] if arr.ndim >= 2 else arr  # drop batch → (R, K) or (R,)
+        if a.ndim == 1:
+            a = a.reshape(-1, 1)
+        field = os_.get("field", "predictions")
+        # Declared class names label the answer. A manifest that says
+        # classes: ["no", "yes"] means predictions come back as "no"/"yes"
+        # and the result carries `classes` so a renderer can head its
+        # probability columns — raw 0/1 with unlabeled columns forces every
+        # reader to already know the encoding.
+        declared = os_.get("classes")
+        classes = [str(c) for c in declared] if isinstance(declared, list) else None
+
+        def _emit(pred_idx: list, probs: list) -> dict:
+            k = len(probs[0]) if probs else 0
+            named = classes if classes and len(classes) == k else None
+            out = {
+                field: [named[i] if named else int(i) for i in pred_idx],
+                "probabilities": probs,
+            }
+            if named:
+                out["classes"] = named
+            return out
+
+        if a.shape[-1] == 1:
+            p1 = 1.0 / (1.0 + np.exp(-a[:, 0]))
+            return _emit(
+                [int(p >= 0.5) for p in p1],
+                [[float(1.0 - p), float(p)] for p in p1],
+            )
+        e = np.exp(a - a.max(axis=-1, keepdims=True))
+        sm = e / e.sum(axis=-1, keepdims=True)
+        return _emit(
+            [int(row.argmax()) for row in sm],
+            [[float(v) for v in row] for row in sm],
+        )
+
+    return {"raw": arr.tolist()}
+
+
+def _call_capabilities(cap_fn: Any, checkpoint_dir: Path) -> Any:
+    """An adapter's capabilities(). One whose task list depends on the checkpoint (e.g. a composed model: its tasks
+    are those of the models it joins) declares a `checkpoint_dir` parameter and gets the folder; others are
+    called as before."""
+    import inspect
+
+    try:
+        takes = "checkpoint_dir" in inspect.signature(cap_fn).parameters
+    except (TypeError, ValueError):
+        takes = False
+    return cap_fn(checkpoint_dir=checkpoint_dir) if takes else cap_fn()
 
 
 def _run_adapter_inference(
@@ -473,7 +688,7 @@ def _run_adapter_inference(
     discover_in_project(project_root)
     try:
         data = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
-    except Exception:  # noqa: BLE001
+    except Exception:
         data = {}
     hp = (data.get("hyperparams") or {}) if isinstance(data, dict) else {}
     if not isinstance(hp, dict):
@@ -481,11 +696,13 @@ def _run_adapter_inference(
 
     try:
         adapter = resolve_adapter(adapter_name, hp.get("adapterModule"))
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         return {
             "engine": adapter_name,
             "command": "predict",
-            "result": {"error": f"the '{adapter_name}' adapter is not available ({type(e).__name__}: {e})."},
+            "result": {
+                "error": f"the '{adapter_name}' adapter is not available ({type(e).__name__}: {e})."
+            },
         }
 
     # Capability manifest — static, weights not needed. Answered BEFORE the
@@ -494,17 +711,29 @@ def _run_adapter_inference(
     if isinstance(payload, dict) and payload.get("__capabilities__"):
         cap_fn = getattr(adapter, "capabilities", None)
         try:
-            caps = cap_fn() if callable(cap_fn) else {}
-        except Exception as e:  # noqa: BLE001
+            caps = _call_capabilities(cap_fn, checkpoint_dir) if callable(cap_fn) else {}
+        except Exception as e:
             return {
                 "engine": adapter_name,
                 "command": "capabilities",
                 "result": {"error": f"capabilities() failed — {type(e).__name__}: {e}"},
             }
+        caps = caps or {}
+        # Fold the adapter's sample/samples and the project's uploaded
+        # samples/*.json into one validated `samples` list per task. Problems
+        # are reported, never silently dropped: a sample shaped for the wrong
+        # input_schema.kind is indistinguishable from no sample at all once it
+        # reaches a form, which is how a broken manifest survived in production.
+        from pfnstudio_core.serving.samples import apply_samples
+
+        sample_issues = apply_samples(caps, project_root)
+        result: dict[str, Any] = {"capabilities": caps}
+        if sample_issues:
+            result["sample_issues"] = sample_issues
         return {
             "engine": adapter_name,
             "command": "capabilities",
-            "result": {"capabilities": caps or {}},
+            "result": result,
         }
 
     predict_fn = getattr(adapter, "predict", None)
@@ -515,17 +744,47 @@ def _run_adapter_inference(
             "result": {"error": f"the '{adapter_name}' adapter does not implement predict() yet."},
         }
 
+    # Same `data_csv` convenience the native path offers. The adapter's own
+    # declared columns give the better error when they're cheap to read; an
+    # adapter whose capabilities() misbehaves simply gets no declared list,
+    # and the CSV still expands into rows + columns for its packer to align.
+    if isinstance(payload, dict) and isinstance(payload.get("inputs"), dict):
+        from ..serving.csv_inputs import CsvInputError, expand_data_csv
+
+        declared = None
+        try:
+            cap_fn = getattr(adapter, "capabilities", None)
+            spec = (
+                (_call_capabilities(cap_fn, checkpoint_dir) or {}).get(payload.get("task"))
+                if callable(cap_fn)
+                else None
+            )
+            cols = ((spec or {}).get("input_schema") or {}).get("columns")
+            declared = [str(c) for c in cols] if cols else None
+        except Exception:
+            declared = None
+        try:
+            payload = {**payload, "inputs": expand_data_csv(payload["inputs"], declared)}
+        except CsvInputError as e:
+            return {
+                "engine": adapter_name,
+                "command": "predict",
+                "result": {"error": str(e)},
+            }
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     try:
         model = adapter.load_model(Path(checkpoint_dir), hp, device)
         model.eval()
         with torch.no_grad():
             result = predict_fn(model, payload or {}, hp, device)
-    except Exception as e:  # noqa: BLE001 — surface as a structured error, not a crash
+    except Exception as e:
         return {
             "engine": adapter_name,
             "command": "predict",
-            "result": {"error": f"the '{adapter_name}' adapter failed during inference — {type(e).__name__}: {e}"},
+            "result": {
+                "error": f"the '{adapter_name}' adapter failed during inference — {type(e).__name__}: {e}"
+            },
         }
 
     return {"engine": adapter_name, "command": "predict", "result": result}
@@ -697,6 +956,38 @@ def _validate_input_dim(payload: dict, expected: int) -> None:
         )
 
 
+def _run_encoder(
+    encoder: list,
+    x: Any,
+    *,
+    batch_tag: Any = None,
+    single_eval_pos: int | None = None,
+) -> Any:
+    """Sequentially apply encoder blocks, threading optional kwargs.
+
+    Shared between the predict path's two entry points so they can't
+    drift. Mirrors the trainer-loop forward pattern: tag-aware blocks
+    receive the tag; n_ctx-aware blocks receive single_eval_pos;
+    everyone else sees only the running tensor. Tuple returns (e.g.
+    AxialAttentionBlock when return_kv=False emits ``(out, None)``)
+    are unwrapped so the next block gets a tensor.
+    """
+    enc_out = x
+    for mod in encoder:
+        kwargs: dict[str, Any] = {}
+        if batch_tag is not None and getattr(mod, "tag_embedder", None) is not None:
+            kwargs["tag"] = batch_tag
+        if (
+            single_eval_pos is not None
+            and single_eval_pos > 0
+            and getattr(mod, "needs_single_eval_pos", False)
+        ):
+            kwargs["single_eval_pos"] = single_eval_pos
+        result = mod(enc_out, **kwargs) if kwargs else mod(enc_out)
+        enc_out = result[0] if isinstance(result, tuple) else result
+    return enc_out
+
+
 def _forward_encoder_and_pick_head(
     model: Any,
     x: Any,
@@ -720,6 +1011,10 @@ def _forward_encoder_and_pick_head(
     ``tag_embedder`` attribute. Same dispatch rule the training loop
     uses, so train-time and inference-time tag routing stay in sync.
 
+    When ``single_eval_pos`` is provided, n_ctx-aware blocks (those
+    declaring ``needs_single_eval_pos = True``) receive it as a kwarg.
+    Same rule the training loop uses for in-context inference.
+
     Returns None when no head produces a matching shape — caller
     surfaces that as a clear error rather than rendering garbage.
     """
@@ -728,21 +1023,12 @@ def _forward_encoder_and_pick_head(
     modules = list(getattr(model, "modules", []))
     encoder, heads = _split_encoder_heads(modules)
     batch_tag = _tile_tag_to_batch(tag_tensor, x)
-    enc_out = x
-    for mod in encoder:
-        kwargs: dict[str, Any] = {}
-        if batch_tag is not None and getattr(mod, "tag_embedder", None) is not None:
-            kwargs["tag"] = batch_tag
-        # n_ctx-aware blocks (e.g. mace_delta_pool, grid_preprocessor) receive
-        # the context/query boundary — same dispatch the training loop uses.
-        if (
-            single_eval_pos is not None
-            and single_eval_pos > 0
-            and getattr(mod, "needs_single_eval_pos", False)
-        ):
-            kwargs["single_eval_pos"] = single_eval_pos
-        result = mod(enc_out, **kwargs) if kwargs else mod(enc_out)
-        enc_out = result[0] if isinstance(result, tuple) else result
+    enc_out = _run_encoder(
+        encoder,
+        x,
+        batch_tag=batch_tag,
+        single_eval_pos=single_eval_pos,
+    )
     head_outputs = [head(enc_out) for head in heads] if heads else [enc_out]
     if not expected_shape_tail:
         return head_outputs[0] if head_outputs else None
@@ -752,6 +1038,22 @@ def _forward_encoder_and_pick_head(
     # No exact match — first head is the best guess (caller can
     # decide whether to surface it). Most single-head models land here.
     return head_outputs[0] if head_outputs else None
+
+
+def _head_to_prediction(model: Any):
+    """Return the model's head-level ``to_prediction`` reducer, or None.
+
+    A distributional head (e.g. a bar-distribution head that outputs
+    per-bucket logits) collapses its output to a point estimate via a
+    ``to_prediction(output) -> (..., 1)`` method. This finds the first
+    block exposing one so the regression predict path can apply it before
+    slicing the scalar channel. Generic: core names no specific head.
+    """
+    for _, mod in getattr(model, "modules", []):
+        fn = getattr(mod, "to_prediction", None)
+        if callable(fn):
+            return fn
+    return None
 
 
 def _tile_tag_to_batch(tag_tensor: Any, x: Any) -> Any:
@@ -805,24 +1107,11 @@ def _pack_context_query(
     return np.concatenate([ctx_tok, q_tok], axis=0).astype(np.float32)
 
 
-def _head_to_prediction(model: Any):
-    """Return the model's head-level ``to_prediction`` reducer, or None.
-
-    A distributional head (e.g. a bar-distribution head that outputs
-    per-bucket logits) collapses its output to a point estimate via a
-    ``to_prediction(output) -> (..., 1)`` method. This finds the first
-    block exposing one so the regression predict path can apply it before
-    slicing the scalar channel. Generic: core names no specific head.
-    """
-    for _, mod in getattr(model, "modules", []):
-        fn = getattr(mod, "to_prediction", None)
-        if callable(fn):
-            return fn
-    return None
-
-
 def _forward_full_sequence(
-    model: Any, seq: Any, tag_tensor: Any = None, single_eval_pos: int | None = None
+    model: Any,
+    seq: Any,
+    tag_tensor: Any = None,
+    single_eval_pos: int | None = None,
 ) -> Any:
     """Run the model on a packed sequence, returning the head output.
 
@@ -832,28 +1121,22 @@ def _forward_full_sequence(
 
     When ``tag_tensor`` is provided, it's tiled to the input's batch
     size and routed to any encoder block exposing a non-None
-    ``tag_embedder`` attribute. ``single_eval_pos`` (the context/query
-    boundary) is routed to n_ctx-aware blocks (grid_preprocessor,
-    axial_attention_block) — same dispatch as the training loop.
+    ``tag_embedder`` attribute — same dispatch as the training loop.
+
+    When ``single_eval_pos`` is provided, n_ctx-aware blocks (those
+    declaring ``needs_single_eval_pos = True``) receive it as a kwarg.
     """
     from .loop import _split_encoder_heads  # type: ignore
 
     modules = list(getattr(model, "modules", []))
     encoder, heads = _split_encoder_heads(modules)
     batch_tag = _tile_tag_to_batch(tag_tensor, seq)
-    enc_out = seq
-    for mod in encoder:
-        kwargs: dict[str, Any] = {}
-        if batch_tag is not None and getattr(mod, "tag_embedder", None) is not None:
-            kwargs["tag"] = batch_tag
-        if (
-            single_eval_pos is not None
-            and single_eval_pos > 0
-            and getattr(mod, "needs_single_eval_pos", False)
-        ):
-            kwargs["single_eval_pos"] = single_eval_pos
-        result = mod(enc_out, **kwargs) if kwargs else mod(enc_out)
-        enc_out = result[0] if isinstance(result, tuple) else result
+    enc_out = _run_encoder(
+        encoder,
+        seq,
+        batch_tag=batch_tag,
+        single_eval_pos=single_eval_pos,
+    )
     head_outputs = [head(enc_out) for head in heads] if heads else [enc_out]
     # Single-output regressor/classifier — pick the first head whose
     # trailing dim is 1. Most catalog templates are single-head.
@@ -863,140 +1146,13 @@ def _forward_full_sequence(
     return head_outputs[0] if head_outputs else None
 
 
-def _read_declared_capabilities(yaml_path: Path) -> dict:
-    """Read a `capabilities:` manifest from a model.yaml / prior.yaml, YAML-only.
-
-    Returns {} when the file is missing, unparseable, or declares no manifest.
-    Deliberately does NOT go through load_model / load_prior (which require the
-    project importable + blocks resolvable) — a capabilities ping must stay
-    cheap and must never depend on the checkpoint, which may live on a remote
-    runner. Same philosophy as the `_peek_*` helpers above.
-    """
-    import yaml
-
-    try:
-        data = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
-    except Exception:  # noqa: BLE001 — any read/parse issue → no manifest
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    caps = data.get("capabilities")
-    return caps if isinstance(caps, dict) else {}
-
-
-def _resolve_native_manifest(manifest_path: Path, project_root: Path) -> dict:
-    """The declared capabilities manifest for a native studio-model run.
-
-    The model's `capabilities:` wins; the prior's is the fallback, so a prior
-    can own the task schema for the data shape it produces. Returns {} when
-    neither declares one. Shared by the capabilities ping and native execution
-    so both read the SAME manifest.
-    """
-    import yaml
-
-    try:
-        run_yaml = yaml.safe_load(Path(manifest_path).read_text(encoding="utf-8")) or {}
-    except Exception:  # noqa: BLE001
-        run_yaml = {}
-
-    def _ref_id(key: str) -> str | None:
-        ref = run_yaml.get(key) if isinstance(run_yaml, dict) else None
-        rid = ref.get("id") if isinstance(ref, dict) else None
-        return rid if isinstance(rid, str) and rid else None
-
-    caps: dict = {}
-    model_id = _ref_id("model")
-    if model_id:
-        caps = _read_declared_capabilities(project_root / "models" / f"{model_id}.yaml")
-    if not caps:
-        prior_id = _ref_id("prior")
-        if prior_id:
-            caps = _read_declared_capabilities(
-                project_root / "priors" / prior_id / "prior.yaml"
-            )
-    return caps if isinstance(caps, dict) else {}
-
-
-def _native_capabilities(*, manifest_path: Path, project_root: Path) -> dict:
-    """Answer the capability manifest for a native studio-model run (no adapter)
-    from its declarative model/prior YAML — no weights, no adapter. Returns the
-    generic capabilities envelope every Try-it surface understands; an empty
-    manifest simply leaves the host on its legacy form.
-    """
-    caps = _resolve_native_manifest(manifest_path, project_root)
-    return {
-        "engine": "pfnstudio",
-        "command": "capabilities",
-        "result": {"capabilities": caps or {}},
-    }
-
-
-def _shape_native_output(spec: dict, pred: Any, node_names: list) -> dict:
-    """Project a native model's head output into the result shape declared by
-    the task's `output_schema.kind`. Currently handles `ranked_list` (the shape
-    the schema-Try-it's bar renderer expects); anything else returns the raw
-    array so the caller can still inspect it.
-    """
-    import numpy as np
-    import torch
-
-    os_ = spec.get("output_schema") if isinstance(spec, dict) else None
-    os_ = os_ if isinstance(os_, dict) else {}
-    kind = os_.get("kind")
-
-    arr = pred.detach().cpu().numpy() if torch.is_tensor(pred) else np.asarray(pred)
-
-    if kind == "ranked_list":
-        # Head output is (B, R, K) (per-row, all rows identical for a broadcast
-        # per-episode answer) or (B, K). Read batch 0's last (query) row.
-        a = arr[0] if arr.ndim >= 2 else arr
-        row = a[-1] if a.ndim == 2 else a  # (K,)
-        field = os_.get("field", "root_causes")
-        name_key = os_.get("label_field", "variable")
-        score_key = os_.get("score_field", "score")
-        limit = int(row.shape[-1])
-        n = min(len(node_names), limit) if node_names else limit
-        items = [
-            {
-                name_key: (node_names[i] if i < len(node_names) else f"x{i + 1}"),
-                score_key: float(row[i]),
-            }
-            for i in range(n)
-        ]
-        items.sort(key=lambda d: -d[score_key])
-        return {field: items}
-
-    if kind in ("classification", "class_probabilities", "probabilities"):
-        # Honor a DECLARED classification task: shape the head output into
-        # class probabilities instead of letting it fall through to a raw /
-        # regression-looking array. Binary (scalar head → 1 logit/row) →
-        # sigmoid; multi-class (K>1 logits) → softmax over the class axis.
-        a = arr[0] if arr.ndim >= 2 else arr  # drop batch → (R, K) or (R,)
-        if a.ndim == 1:
-            a = a.reshape(-1, 1)
-        field = os_.get("field", "predictions")
-        if a.shape[-1] == 1:
-            p1 = 1.0 / (1.0 + np.exp(-a[:, 0]))
-            return {
-                field: [int(p >= 0.5) for p in p1],
-                "probabilities": [[float(1.0 - p), float(p)] for p in p1],
-            }
-        e = np.exp(a - a.max(axis=-1, keepdims=True))
-        sm = e / e.sum(axis=-1, keepdims=True)
-        return {
-            field: [int(row.argmax()) for row in sm],
-            "probabilities": [[float(v) for v in row] for row in sm],
-        }
-
-    return {"raw": arr.tolist()}
-
-
 def _dispatch_inference(
     model: Any,
     payload: dict,
     *,
     expected_d_in: int | None = None,
     tag_tensor: Any = None,
+    device: Any = None,
 ) -> dict:
     """Route the payload to the regression / classification / discovery
     path based on which keys are present. Returns the inference output dict.
@@ -1023,6 +1179,10 @@ def _dispatch_inference(
     import numpy as np
     import torch
 
+    dev = device or torch.device("cpu")
+    if tag_tensor is not None and hasattr(tag_tensor, "to"):
+        tag_tensor = tag_tensor.to(dev)
+
     # Classification: {"context": {"x": ..., "labels": [...]}, "query": {"x": ...}}
     if "context" in payload and "query" in payload and "labels" in (payload.get("context") or {}):
         ctx = payload["context"]
@@ -1047,12 +1207,54 @@ def _dispatch_inference(
         n_ctx = int(x_ctx.shape[0])
 
         with torch.no_grad():
-            inp = torch.from_numpy(seq).float().unsqueeze(0)  # (1, N, F+2)
-            out = _forward_full_sequence(model, inp, tag_tensor=tag_tensor, single_eval_pos=n_ctx)
+            inp = torch.from_numpy(seq).float().unsqueeze(0).to(dev)  # (1, N, F+2)
+            out = _forward_full_sequence(
+                model,
+                inp,
+                tag_tensor=tag_tensor,
+                single_eval_pos=n_ctx,
+            )
             if out is None:
                 raise ValueError(
                     "Model has no head producing a scalar logit per token — expected a scalar_head."
                 )
+            # Multi-class head (a K-way classification head, trailing dim
+            # K > 1) — previously this code always
+            # sliced channel 0 and ran it through the binary sigmoid path,
+            # silently discarding classes 1..K-1. Softmax over the full
+            # trailing dimension instead. Padded slots are already
+            # large-negative in such heads' own logits, so plain softmax
+            # suppresses them without needing a separate validity mask.
+            k = int(out.shape[-1])
+            if k > 1:
+                logits = out[0, n_ctx:, :]  # (Q, K), query positions only
+                probs_k = torch.softmax(logits, dim=-1).cpu().numpy()
+                preds_k = probs_k.argmax(axis=-1).tolist()
+
+                # Trim padding columns from the response. K-way heads that
+                # pad to a fixed width force padded-slot logits to a
+                # large negative sentinel (~-1e9) so softmax suppresses them
+                # to ~0 — mathematically correct, but returning all K
+                # (often 100) values when only the first few are real nodes
+                # forces every caller to already know K to make sense of the
+                # response. Padding is always a contiguous tail (real nodes
+                # packed at the front), so the boundary is just the highest
+                # index whose raw logit clears the sentinel threshold.
+                PADDING_SENTINEL = -1e8
+                raw_np = logits.cpu().numpy()
+                real_cols = np.where(raw_np[0] > PADDING_SENTINEL)[0]
+                num_real = int(real_cols.max()) + 1 if real_cols.size else k
+                probs_trimmed = probs_k[:, :num_real] if num_real < k else probs_k
+
+                return {
+                    "task": "multiclass",
+                    "predictions": preds_k,
+                    "probabilities": probs_trimmed.tolist(),
+                    "num_real_classes": num_real,
+                    "num_classes": k,
+                    "context_size": int(x_ctx.shape[0]),
+                    "query_size": int(x_qry.shape[0]),
+                }
             logits = out[0, n_ctx:, 0]  # query positions only
             probs = torch.sigmoid(logits).cpu().numpy().tolist()
             preds = [1 if p >= 0.5 else 0 for p in probs]
@@ -1089,8 +1291,13 @@ def _dispatch_inference(
         n_ctx = int(x_ctx.shape[0])
 
         with torch.no_grad():
-            inp = torch.from_numpy(seq).float().unsqueeze(0)  # (1, N, F+2)
-            out = _forward_full_sequence(model, inp, tag_tensor=tag_tensor, single_eval_pos=n_ctx)
+            inp = torch.from_numpy(seq).float().unsqueeze(0).to(dev)  # (1, N, F+2)
+            out = _forward_full_sequence(
+                model,
+                inp,
+                tag_tensor=tag_tensor,
+                single_eval_pos=n_ctx,
+            )
             if out is None:
                 raise ValueError(
                     "Model has no head producing scalar predictions — expected a scalar_head."
@@ -1098,9 +1305,10 @@ def _dispatch_inference(
             # Generic distributional-head reduction. A head that emits a
             # distribution over buckets (e.g. a bar-distribution head, output
             # shape (..., num_buckets)) exposes `to_prediction(output) ->
-            # (..., 1)` to collapse its logits to a point estimate. Duck-typed
-            # + OPTIONAL: a plain scalar_head has no such method, so `out`
-            # passes through unchanged and the channel-0 slice is the scalar.
+            # (..., 1)` to collapse its logits to a point estimate (the
+            # distribution mean). Duck-typed + OPTIONAL: a plain scalar_head
+            # has no such method, so `out` passes through unchanged and the
+            # channel-0 slice below is the scalar it already produced.
             reduce_fn = _head_to_prediction(model)
             if reduce_fn is not None:
                 out = reduce_fn(out)
@@ -1117,7 +1325,7 @@ def _dispatch_inference(
     if "X" in payload and "y" not in payload:
         X = np.asarray(payload["X"], dtype=np.float32)
         with torch.no_grad():
-            xt = torch.from_numpy(X).float().unsqueeze(0)
+            xt = torch.from_numpy(X).float().unsqueeze(0).to(dev)
             out = _forward_encoder_and_pick_head(model, xt, (), tag_tensor=tag_tensor)
             if out is None:
                 raise ValueError("Model has no head — can't run discovery inference.")

@@ -7,6 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from .model_blocks import filter_block_config
 from .registry import get_block
 
 
@@ -30,6 +31,14 @@ class ModelSpec(BaseModel):
     input_shape: str | None = None
     output_heads: list[OutputHead] = Field(default_factory=list)
     citations: list[str] = Field(default_factory=list)
+    # Declarative Try-it / Inference manifest for a NATIVE studio model (no
+    # adapter). Maps a task key → {label, description, input_schema:{kind,…},
+    # output_schema:{kind,field,…}, sample?} — the same shape an adapter's
+    # capabilities() returns and the schema-driven Try-it renders. Empty (the
+    # default) means the model declares no tasks, so the Try-it falls back to
+    # the legacy per-eval form. The prior may declare this instead; the model
+    # wins when both do. See predict.run_inference's __capabilities__ branch.
+    capabilities: dict[str, Any] = Field(default_factory=dict)
 
 
 class Model:
@@ -46,7 +55,7 @@ class Model:
         self.modules: list[tuple[str, Any]] = []
         for i, block in enumerate(spec.blocks):
             cls = get_block(block.type)
-            instance = cls(**block.config)
+            instance = cls(**filter_block_config(block.type, block.config))
             label = block.name or f"{block.type}_{i}"
             self.modules.append((label, instance))
 

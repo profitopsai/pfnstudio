@@ -6,7 +6,7 @@ End-to-end flow when `submit()` is called:
      looking up the run's compute.host_id in the ComputeHost table).
   2. Tar the project locally; scp it to <workspace>/run-<id>.tgz on the
      remote.
-  3. SSH in, untar under <workspace>/run-<id>/, install priorstudio + the
+  3. SSH in, untar under <workspace>/run-<id>/, install pfnstudio + the
      project's requirements.txt, then run the local adapter inside that
      dir with PFNSTUDIO_JSON_PROGRESS=1 so progress events flow back
      to us line-by-line.
@@ -58,9 +58,9 @@ def _config_from_env() -> dict[str, Any]:
             str(Path.home() / ".ssh" / "id_rsa"),
         ),
         "workspace": os.environ.get("REMOTE_WORKSPACE"),
-        # When the host has priorstudio installed in a specific venv,
+        # When the host has pfnstudio installed in a specific venv,
         # the user pastes that venv's python in /settings/hosts. Empty
-        # means "fall back to whatever `priorstudio` is on PATH".
+        # means "fall back to `python3 -m pfnstudio` on the remote host".
         "python": os.environ.get("REMOTE_PYTHON"),
         "host_name": os.environ.get("REMOTE_HOST_NAME", "remote"),
     }
@@ -270,11 +270,49 @@ class RemoteAdapter(ComputeAdapter):
             }
 
         # Per-dispatch subdir so concurrent runs don't trample each other.
-        run_dir = f"{cfg['workspace'].rstrip('/')}/run-{uuid.uuid4().hex[:8]}"
+        #
+        # PFNSTUDIO_RUN_DIR_REUSE env var lets the API dispatch a
+        # 'resume' attempt into the same workspace the previous
+        # attempt used. The trainer's resume-from-checkpoint logic
+        # (loop.py) then finds the existing model_step_N.pt /
+        # optim_step_N.pt files and continues training instead of
+        # starting from scratch. Combined with REMOTE_KEEP_WORKSPACE=1
+        # (the default), this makes Marathon-scale runs on
+        # preemptible Vast offers survivable: preemption → retry →
+        # trainer picks up at the last eval cycle instead of step 0.
+        #
+        # When unset (the normal first-dispatch case) we fall back to
+        # a fresh UUID so concurrent runs stay isolated.
+        reuse = os.environ.get("PFNSTUDIO_RUN_DIR_REUSE", "").strip()
+        if reuse:
+            # Sanity-strip: only the last path segment is meaningful;
+            # callers should pass the bare run-XXXXXXXX, but tolerate
+            # an accidental full path.
+            reuse_name = reuse.rstrip("/").split("/")[-1]
+            if not reuse_name:
+                reuse_name = f"run-{uuid.uuid4().hex[:8]}"
+            run_dir = f"{cfg['workspace'].rstrip('/')}/{reuse_name}"
+            _emit_log(
+                f"PFNSTUDIO_RUN_DIR_REUSE set → reusing workspace {run_dir} "
+                f"(trainer will resume from checkpoint if one exists)"
+            )
+        else:
+            run_dir = f"{cfg['workspace'].rstrip('/')}/run-{uuid.uuid4().hex[:8]}"
         tarball_path = f"{run_dir}.tgz"
 
+        # Announce the workspace path on a structured event so the API
+        # runner can persist it on the Run row. The Resume button
+        # reads this back and passes it as PFNSTUDIO_RUN_DIR_REUSE on
+        # the next attempt — without that the new attempt would land
+        # in a fresh dir and the trainer's checkpoint scan wouldn't
+        # find anything to resume from.
+        _emit(
+            "remote.workspace",
+            run_dir=run_dir,
+            reused=bool(reuse),
+        )
         _emit("remote.uploading_project", target=run_dir)
-        _emit_log("packing project + priorstudio packages…")
+        _emit_log("packing project + pfnstudio packages…")
         tar_start = time.time()
         tarball = _make_project_tarball(project_root)
         tar_size = tarball.stat().st_size
@@ -303,40 +341,69 @@ class RemoteAdapter(ComputeAdapter):
         try:
             run_rel = run_yaml.relative_to(project_root)
             # Choose the Python executable: explicit per-host path (e.g.
-            # /home/ubuntu/.venv/bin/python) or fall back to `priorstudio`
-            # on PATH. The remote install step is identical either way.
+            # /venv/main/bin/python) or fall back to `python3 -m pfnstudio`.
             # Build the shell snippets in plain strings so we don't rely on
             # the relaxed-f-string parser (Python 3.12+); older 3.10/3.11
             # remotes would otherwise reject the install on import.
             py = cfg.get("python")
+            # Non-interactive SSH often has no venv on PATH — always invoke
+            # via `python -m` so install and run use the same interpreter.
             py_cmd = f'"{py}"' if py else "python3"
-            pip_cmd = f'"{py}" -m pip' if py else "pip"
-            ps_cmd = f'"{py}" -m priorstudio' if py else "priorstudio"
-            # Torch is required by pfnstudio-core but isn't bundled as a
-            # hard dep (it's huge, GPU-specific, and the local install lets
-            # the user pick CUDA vs CPU wheels). Vast templates vary —
-            # most PyTorch images ship torch already, some bare CUDA
-            # templates don't. Check first; install only if missing, so
-            # we don't redownload 2GB every dispatch on a properly-set-up
-            # instance. Default index (download.pytorch.org) auto-picks
-            # the right CUDA wheel for the host.
+            pip_cmd = f'"{py}" -m pip' if py else "python3 -m pip"
+            ps_cmd = f'"{py}" -m pfnstudio' if py else "python3 -m pfnstudio"
+            # Bootstrap pip on fresh AMIs (ensurepip → apt/yum). Torch + pfnstudio
+            # packages install on first dispatch; GPU + API pub key are manual.
+            pip_bootstrap = (
+                f"if ! {py_cmd} -m pip --version >/dev/null 2>&1; then "
+                f"  echo '[remote] pip missing — bootstrapping…'; "
+                f"  {py_cmd} -m ensurepip --upgrade --user 2>/dev/null || true; "
+                f'  export PATH="$HOME/.local/bin:$PATH"; '
+                f"  if ! {py_cmd} -m pip --version >/dev/null 2>&1; then "
+                f"    if command -v apt-get >/dev/null 2>&1 && sudo -n true 2>/dev/null; then "
+                f"      echo '[remote] installing python3-pip via apt (one-time)…'; "
+                f"      sudo -n apt-get update -qq && "
+                f"      sudo -n DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-pip python3-venv; "
+                f"    elif command -v dnf >/dev/null 2>&1 && sudo -n true 2>/dev/null; then "
+                f"      echo '[remote] installing python3-pip via dnf (one-time)…'; "
+                f"      sudo -n dnf install -y -q python3-pip; "
+                f"    elif command -v yum >/dev/null 2>&1 && sudo -n true 2>/dev/null; then "
+                f"      echo '[remote] installing python3-pip via yum (one-time)…'; "
+                f"      sudo -n yum install -y -q python3-pip; "
+                f"    fi; "
+                f'    export PATH="$HOME/.local/bin:$PATH"; '
+                f"  fi; "
+                f"  if ! {py_cmd} -m pip --version >/dev/null 2>&1; then "
+                f"    echo '[remote] ERROR: could not install pip automatically (need passwordless sudo or a prebuilt AMI). "
+                f"         SSH in and run: sudo apt install -y python3-pip python3-venv'; "
+                f"    exit 1; "
+                f"  fi; "
+                f"  echo '[remote] pip ready ✓'; "
+                f"fi"
+            )
             install_cmd = (
                 f"set -euo pipefail; "
                 f"mkdir -p '{run_dir}' && cd '{run_dir}' && "
                 f"tar -xzf '{tarball_path}' && "
+                f"{pip_bootstrap} && "
+                f"if ! command -v nvidia-smi >/dev/null 2>&1; then "
+                f"  echo '[remote] ERROR: no NVIDIA GPU detected (nvidia-smi missing). "
+                f"         standard-pfn and other GPU runs need a CUDA box — use Vast.ai, "
+                f"         an EC2 GPU instance (g4dn/g5/p3), or Studio CPU for sanity tests only.'; "
+                f"  exit 1; "
+                f"fi && "
                 f"if ! {py_cmd} -c 'import torch' 2>/dev/null; then "
                 f"  echo '[remote] torch missing — installing CUDA wheels (one-time, ~2GB)…'; "
                 f"  {pip_cmd} install --quiet torch --index-url https://download.pytorch.org/whl/cu121 "
                 f"    || {pip_cmd} install --quiet torch; "
                 f"fi && "
-                f"{pip_cmd} install --quiet -e ./pfnstudio-core -e ./priorstudio-cli && "
+                f"{pip_cmd} install --quiet -e ./pfnstudio-core -e ./pfnstudio-cli && "
                 f"if [ -f ./project/requirements.txt ]; then "
                 f"  {pip_cmd} install --quiet -r ./project/requirements.txt; "
                 f"fi"
             )
             _emit("remote.installing")
             _emit_log(f"extracting tarball → {run_dir}")
-            _emit_log("checking torch availability + installing priorstudio packages…")
+            _emit_log("checking torch availability + installing pfnstudio packages…")
             install_start = time.time()
             rc = _remote_ssh_stream(cfg, install_cmd)
             if rc != 0:
@@ -394,7 +461,7 @@ class RemoteAdapter(ComputeAdapter):
             # The original remote-path `done` was already streamed; this
             # one overrides it because the API runner keeps the latest.
             remote_ckpt_dir = f"{run_dir}/project/checkpoint"
-            local_ckpt_dir = Path(tempfile.mkdtemp(prefix="priorstudio-remote-ckpt-"))
+            local_ckpt_dir = Path(tempfile.mkdtemp(prefix="pfnstudio-remote-ckpt-"))
             _emit_log(f"pulling checkpoint: {remote_ckpt_dir}")
             ckpt_start = time.time()
             try:
@@ -436,16 +503,31 @@ class RemoteAdapter(ComputeAdapter):
                     {
                         "provider": "remote",
                         "host_name": cfg["host_name"],
+                        "ssh_endpoint": (f"{cfg['ssh_user']}@{cfg['ssh_host']}:{cfg['ssh_port']}"),
+                        "ssh_host": cfg["ssh_host"],
+                        "ssh_port": cfg["ssh_port"],
+                        "workspace": cfg["workspace"],
                         "elapsed_seconds": round(elapsed, 2),
                     }
                 )
             return results
         finally:
-            # Best-effort cleanup of the per-dispatch dir + tarball. The
-            # user manages disk on their own box; leaving stale dirs on
-            # crash is fine, the next run will create a new one.
-            _emit_log(f"cleanup: rm -rf {run_dir} {tarball_path}")
-            try:
-                _remote_ssh_stream(cfg, f"rm -rf '{run_dir}' '{tarball_path}'")
-            except Exception as e:
-                _emit_log(f"cleanup of {run_dir} failed: {e} (non-fatal)")
+            # Keep the per-dispatch dir on the GPU by default so you can SSH in
+            # after a successful run and confirm artifacts (checkpoint, logs).
+            # Set REMOTE_KEEP_WORKSPACE=0 on the API host to restore auto-cleanup.
+            keep = os.environ.get("REMOTE_KEEP_WORKSPACE", "1").strip().lower() not in (
+                "0",
+                "false",
+                "no",
+            )
+            if keep:
+                _emit_log(
+                    f"keeping remote workspace (inspect on GPU): {run_dir} "
+                    f"(set REMOTE_KEEP_WORKSPACE=0 to auto-delete after runs)"
+                )
+            else:
+                _emit_log(f"cleanup: rm -rf {run_dir} {tarball_path}")
+                try:
+                    _remote_ssh_stream(cfg, f"rm -rf '{run_dir}' '{tarball_path}'")
+                except Exception as e:
+                    _emit_log(f"cleanup of {run_dir} failed: {e} (non-fatal)")

@@ -47,6 +47,32 @@ def lint_project(project: Path) -> list[str]:
         spec = _safe_load(eval_yaml)
         if "id" in spec:
             eval_ids[spec["id"]] = spec.get("version", "")
+        # An eval that declares metrics needs code to compute them. The
+        # scoring code is a sibling `evals/<slug>.py` with @register_scorer.
+        # If that file exists but registers no scorer (empty / forgot the
+        # decorator), the declared metrics silently never get computed — the
+        # run reports nothing with no clue why. Flag it at author time.
+        # (A *missing* .py may be covered by a core built-in scorer, so we
+        # don't flag that here; the run-time path surfaces it with a reason.)
+        declared_metrics = spec.get("metrics") or []
+        if declared_metrics:
+            scorer_py = eval_yaml.with_suffix(".py")
+            if scorer_py.exists():
+                try:
+                    code = scorer_py.read_text()
+                except Exception:
+                    code = ""
+                if "register_scorer" not in code:
+                    metric_names = ", ".join(
+                        m.get("name", str(m)) if isinstance(m, dict) else str(m)
+                        for m in declared_metrics
+                    )
+                    errors.append(
+                        f"{eval_yaml}: declares metrics ({metric_names}) but "
+                        f"{scorer_py.name} has no @register_scorer — nothing will "
+                        f"compute those metrics. Add a DatasetScorer decorated "
+                        f'with @register_scorer("{spec.get("id", eval_yaml.stem)}").'
+                    )
 
     for run_yaml in (project / "runs").glob("*.yaml"):
         spec = _safe_load(run_yaml)

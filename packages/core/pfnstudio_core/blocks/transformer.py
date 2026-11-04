@@ -40,7 +40,14 @@ class TransformerEncoder:
             batch_first=True,
             norm_first=True,
         )
-        self.module = nn.TransformerEncoder(layer, num_layers=n_layers)
+        # enable_nested_tensor is silently disabled when norm_first=True
+        # (pre-LayerNorm). Pass False explicitly so PyTorch doesn't warn —
+        # we know the optimization can't apply to the pre-norm variant.
+        self.module = nn.TransformerEncoder(
+            layer,
+            num_layers=n_layers,
+            enable_nested_tensor=False,
+        )
         self.d_model = d_model
 
     def __call__(self, x: Any) -> Any:
@@ -94,7 +101,14 @@ class TagAwareTransformerEncoder:
             batch_first=True,
             norm_first=True,
         )
-        self.module = nn.TransformerEncoder(layer, num_layers=n_layers)
+        # enable_nested_tensor is silently disabled when norm_first=True
+        # (pre-LayerNorm). Pass False explicitly so PyTorch doesn't warn —
+        # we know the optimization can't apply to the pre-norm variant.
+        self.module = nn.TransformerEncoder(
+            layer,
+            num_layers=n_layers,
+            enable_nested_tensor=False,
+        )
         self.d_model = d_model
         self.tag_dim = tag_dim
         # Only allocate the tag embedder when tag_dim > 0. Zero-dim tag

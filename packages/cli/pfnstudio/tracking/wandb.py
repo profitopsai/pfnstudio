@@ -20,7 +20,7 @@ class WandbTracker(Tracker):
         except ImportError:
             self._run = None
             return
-        project = config.get("tracking", {}).get("wandb_project") or "priorstudio"
+        project = config.get("tracking", {}).get("wandb_project") or "pfnstudio"
         self._run = wandb.init(project=project, name=run_id, config=config, reinit=True)
 
     def log_metrics(self, metrics: dict[str, float], step: int | None = None) -> None:

@@ -7,13 +7,15 @@ from pathlib import Path
 import yaml
 
 from .eval import EvalSpec
+from .eval_normalize import normalize_eval_raw
 from .model import ModelSpec
+from .model_blocks import normalize_model_blocks
 from .prior import PriorSpec
 from .run import RunSpec
 
 
 def _read_yaml(path: Path) -> dict:
-    with path.open() as f:
+    with path.open(encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
@@ -22,11 +24,18 @@ def load_prior(path: Path) -> PriorSpec:
 
 
 def load_model(path: Path) -> ModelSpec:
-    return ModelSpec.model_validate(_read_yaml(path))
+    raw = _read_yaml(path)
+    if isinstance(raw.get("blocks"), list):
+        heads = raw.get("output_heads") if isinstance(raw.get("output_heads"), list) else None
+        raw["blocks"] = normalize_model_blocks(raw["blocks"], output_heads=heads)
+    return ModelSpec.model_validate(raw)
 
 
 def load_eval(path: Path) -> EvalSpec:
-    return EvalSpec.model_validate(_read_yaml(path))
+    raw = _read_yaml(path)
+    if isinstance(raw, dict):
+        raw = normalize_eval_raw(raw)
+    return EvalSpec.model_validate(raw)
 
 
 def load_run(path: Path) -> RunSpec:

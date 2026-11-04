@@ -11,9 +11,12 @@ from rich.table import Table
 
 from . import __version__
 from .compute import ADAPTERS, get_adapter
+from .create_cli import alias_path, create_commands
 from .lint import lint_project
+from .lock import build_lock, parse_model_ref, write_lock
 from .runner import runner_app
 from .scaffold import scaffold_project
+from .store_cli import store_commands
 from .tracking import select_trackers
 from .validate import validate_project
 
@@ -36,6 +39,11 @@ app.add_typer(author_app, name="author")
 # Self-hosted runner: this machine pulls jobs from PFN Studio cloud and
 # trains them locally. Mirrors GitHub Actions' self-hosted runner.
 app.add_typer(runner_app, name="runner")
+
+# Base-model lifecycle (Ollama-shaped): pull / ls / ps / rm / show live in
+# store_cli, `create -f Pfnfile` in create_cli; `run` and `serve` are below.
+store_commands(app)
+create_commands(app)
 
 console = Console()
 
@@ -191,13 +199,33 @@ def sample(
 
     overrides = json.loads(overrides_json)
 
+    import math as _math
+
     def _to_jsonable(v):
+        # JSON.parse() on the API side (TypeScript) is standards-compliant
+        # and rejects the non-finite floats Python's json.dumps emits by
+        # default ('NaN', 'Infinity', '-Infinity'). Priors that emit NaN
+        # — e.g. Do-PFN's prior, which appends a y-feature column with
+        # NaN at query rows so the preprocessor knows what to mean-impute
+        # — would otherwise produce stdout the API can't parse. Convert
+        # non-finite floats to None at every level so the JSON we emit is
+        # standards-compliant; the API + UI render None as "missing".
         try:
             import numpy as np
 
             if isinstance(v, np.ndarray):
+                if v.dtype.kind == "f":
+                    # Replace non-finite cells with None before tolist().
+                    # astype(object) so the array can hold None alongside floats.
+                    finite = np.isfinite(v)
+                    if not finite.all():
+                        cleaned = np.where(finite, v, None).astype(object)
+                        return cleaned.tolist()
                 return v.tolist()
-            if isinstance(v, (np.floating, np.integer)):
+            if isinstance(v, np.floating):
+                x = float(v.item())
+                return x if _math.isfinite(x) else None
+            if isinstance(v, np.integer):
                 return v.item()
         except ImportError:
             pass
@@ -205,14 +233,16 @@ def sample(
             import torch
 
             if isinstance(v, torch.Tensor):
-                return v.detach().cpu().tolist()
+                return _to_jsonable(v.detach().cpu().numpy())
         except ImportError:
             pass
         if isinstance(v, dict):
             return {k: _to_jsonable(x) for k, x in v.items()}
         if isinstance(v, (list, tuple)):
             return [_to_jsonable(x) for x in v]
-        if isinstance(v, (int, float, str, bool)) or v is None:
+        if isinstance(v, float):
+            return v if _math.isfinite(v) else None
+        if isinstance(v, (int, str, bool)) or v is None:
             return v
         return None  # silently drop non-serialisable
 
@@ -231,7 +261,56 @@ def sample(
         "overrides": overrides,
         "samples": samples,
     }
-    print(json.dumps(payload))
+    # allow_nan=False — if any non-finite float slips past _to_jsonable
+    # we want a hard error here, NOT silent emission of invalid JSON
+    # the API can't parse. The scrub above should make this unreachable;
+    # the strict flag is the safety net.
+    print(json.dumps(payload, allow_nan=False))
+
+
+@app.command("check-model")
+def check_model(
+    project: Path = typer.Argument(..., help="Project root containing models/<slug>.yaml."),
+    model: str = typer.Argument(..., help="Model slug (matches models/<slug>.yaml)."),
+) -> None:
+    """Assemble a model's blocks and emit JSON to stdout.
+
+    Instantiates every block via the registry exactly as the trainer does
+    (load_model normalizes, then Model(spec) builds each block). Catches
+    unknown block types / bad config / dimension errors. Used by the API's
+    Plip test_model tool. Emits a single JSON object (exit 0 even when the
+    build fails, so the caller can read the reason):
+        {"ok": true, "blocks": [{"name","type"}], "heads": ["name:task"]}
+        {"ok": false, "error": "KeyError: ..."}
+    """
+    import sys
+
+    project = project.resolve()
+    sys.path.insert(0, str(project))
+
+    from pfnstudio_core import Model
+    from pfnstudio_core.loaders import load_model
+    from pfnstudio_core.registry import discover_in_project
+
+    model_yaml = project / "models" / f"{model}.yaml"
+    if not model_yaml.exists():
+        print(json.dumps({"ok": False, "error": f"models/{model}.yaml not found"}))
+        raise typer.Exit(code=1)
+
+    # Register any project-local blocks (built-ins register on core import).
+    try:
+        discover_in_project(project)
+    except Exception:
+        pass
+
+    try:
+        spec = load_model(model_yaml)
+        built = Model(spec)
+        blocks = [{"name": label, "type": mod.__class__.__name__} for label, mod in built.modules]
+        heads = [f"{h.name}:{h.task}" for h in spec.output_heads]
+        print(json.dumps({"ok": True, "blocks": blocks, "heads": heads}))
+    except Exception as e:
+        print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}))
 
 
 @app.command()
@@ -262,7 +341,7 @@ def push(
     """Bulk-upload artifacts from a local project directory to PFN Studio.
 
     Example:
-        priorstudio push my-tcpfn-priors --project-id tcpfn-port --token ps_xxx
+        pfnstudio push my-tcpfn-priors --project-id tcpfn-port --token ps_xxx
     """
     import requests
     import yaml as _y
@@ -423,6 +502,48 @@ def push(
                 console.print(f"[red]✗[/red] model {spec['id']}: {r.status_code} {r.text[:200]}")
                 failed += 1
 
+    if "evals" in kinds:
+        # evals/ may be flat (one YAML per file) or nested (one dir per
+        # eval with eval.yaml inside) — accept both shapes.
+        eval_yamls = sorted((project_dir / "evals").glob("*.yaml"))
+        eval_yamls += sorted((project_dir / "evals").rglob("eval.yaml"))
+        for eval_yaml in eval_yamls:
+            spec = _y.safe_load(eval_yaml.read_text()) or {}
+            # API DTO is camelCase / flat:
+            #   task, dataset (object), metrics (array), baselines (array)
+            body = {
+                "name": spec.get("name") or spec["id"],
+                "slug": spec["id"],
+                "version": spec["version"],
+                "task": spec["task"],
+                "description": spec.get("description"),
+                "dataset": spec.get("dataset") or {},
+                "metrics": spec.get("metrics") or [],
+                "baselines": spec.get("baselines") or [],
+                "citations": spec.get("citations") or [],
+            }
+            r = requests.post(
+                f"{base}/projects/{resolved_id}/evals",
+                headers=headers,
+                json=body,
+                timeout=30,
+            )
+            if r.status_code in (200, 201):
+                console.print(f"[green]✓[/green] eval {spec['id']}")
+                pushed += 1
+            elif r.status_code == 409 or "unique" in (r.text or "").lower():
+                if skip_existing:
+                    console.print(f"[yellow]⤳[/yellow] eval {spec['id']} already exists — skipped")
+                    skipped += 1
+                else:
+                    console.print(
+                        f"[red]✗[/red] eval {spec['id']} conflict; pass --no-skip-existing to fail loudly"
+                    )
+                    failed += 1
+            else:
+                console.print(f"[red]✗[/red] eval {spec['id']}: {r.status_code} {r.text[:200]}")
+                failed += 1
+
     console.print()
     console.print(f"[bold]done:[/bold] {pushed} pushed, {skipped} skipped, {failed} failed.")
     if failed > 0:
@@ -437,7 +558,7 @@ def _die_token() -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# `priorstudio author wrap` — generate a PFN Studio prior from any
+# `pfnstudio author wrap` — generate a PFN Studio prior from any
 # Python class with a `sample_batch(batch_size, seed, **kw)` method (or any
 # entry-point you can describe).
 #
@@ -482,7 +603,7 @@ def author_wrap(
           └── requirements.txt   — pip-installable deps
 
     After running this for each prior you want to migrate, push them with:
-        priorstudio push <out-dir> --project-id <slug>
+        pfnstudio push <out-dir> --project-id <slug>
     """
     import importlib
     import inspect
@@ -602,7 +723,7 @@ def author_wrap(
 
     prior_py = f'''"""Auto-generated wrapper for {module_path}:{class_name}.
 
-Generated by `priorstudio author wrap`. Edit freely — this is just a starting
+Generated by `pfnstudio author wrap`. Edit freely — this is just a starting
 point. The PFN Studio sampler will install requirements.txt before importing
 this file, so the wrapped class needs to be available via that.
 """
@@ -673,7 +794,7 @@ version: 0.1.0
 kind: {kind}
 description: |
   Wrapped from {module_path}:{class_name}.
-  Generated by `priorstudio author wrap`. Edit this file to fill in
+  Generated by `pfnstudio author wrap`. Edit this file to fill in
   output variables and tighten parameter ranges.
 
 parameters:
@@ -708,8 +829,8 @@ Wrapper around `{module_path}:{class_name}`.
 - [ ] Verify the `sample()` method correctly unwraps the batch returned by the original class
 - [ ] Fill in `outputs.variables` in prior.yaml with actual shapes and descriptions
 - [ ] Tighten parameter ranges in prior.yaml (e.g., add `range: [lo, hi]` for sliders)
-- [ ] Test locally with `priorstudio sample <project-dir> {slug} --count 3`
-- [ ] Push with `priorstudio push <project-dir> --project-id <project>`
+- [ ] Test locally with `pfnstudio sample <project-dir> {slug} --count 3`
+- [ ] Push with `pfnstudio push <project-dir> --project-id <project>`
 
 ## Why this prior exists
 
@@ -729,18 +850,98 @@ Wrapper around `{module_path}:{class_name}`.
     console.print("[bold]Next:[/bold]")
     console.print(f"  1. Edit [cyan]{prior_dir}/prior.yaml[/cyan] — fill in outputs[].variables")
     console.print(f"  2. Edit [cyan]{prior_dir}/prior.py[/cyan] — verify the sample() unwrap logic")
-    console.print(f"  3. Test: [cyan]priorstudio sample {out} {slug} --count 3[/cyan]")
-    console.print(f"  4. Push: [cyan]priorstudio push {out} --project-id <slug>[/cyan]")
+    console.print(f"  3. Test: [cyan]pfnstudio sample {out} {slug} --count 3[/cyan]")
+    console.print(f"  4. Push: [cyan]pfnstudio push {out} --project-id <slug>[/cyan]")
 
 
 @app.command()
 def run(
-    manifest: Path = typer.Argument(..., help="Path to a run YAML."),
-    project: Path = typer.Option(None, help="Project root (default: parent of runs/)."),
+    what: str = typer.Argument(
+        ...,
+        metavar="RUN_YAML|MODEL[:TAG]|NAME",
+        help="A run YAML to execute (runs/<slug>.yaml), a marketplace base-model "
+        "ref — 'cdfm-base', 't0-alpha-base:latest' — or the name of a "
+        "model made with `pfnstudio create`.",
+    ),
+    project: Path = typer.Option(
+        None, help="Project root (default: parent of runs/). Run-YAML form only."
+    ),
     target: str = typer.Option(
-        None, help=f"Override compute target. Available: {sorted(ADAPTERS)}"
+        None,
+        help=f"Override compute target. Available: {sorted(ADAPTERS)}. Run-YAML form only.",
+    ),
+    api_url: str = typer.Option(
+        "https://cloud.pfnstudio.com/api",
+        "--api-url",
+        envvar="PFNSTUDIO_API_URL",
+        help="PFN Studio API base (public marketplace listings are unauthenticated). "
+        "Defaults to the hosted marketplace; point it at a local studio with "
+        "--api-url or PFNSTUDIO_API_URL. Model form only.",
+    ),
+    basemodels: Path = typer.Option(
+        None,
+        "--basemodels",
+        envvar="PFNSTUDIO_BASEMODELS_DIR",
+        help="Directory containing <fmProject>/adapters/. Auto-detected from a "
+        "repo checkout when omitted. Model form only.",
+    ),
+    task: str = typer.Option(
+        None,
+        help="Which capability task to run (default: the first the model declares). "
+        "Model form only.",
+    ),
+    input_json: Path = typer.Option(
+        None,
+        "--input",
+        help="JSON payload to run instead of the built-in self-diagnostic "
+        "(same shape the web Try-it posts). Omit to run the model's own "
+        "held-out sample. Model form only.",
+    ),
+    install_deps: bool = typer.Option(
+        False,
+        "--install-deps",
+        help="pip-install the adapter's requirements.txt (its upstream model "
+        "package) before running. Off by default: nothing is installed silently. "
+        "Model form only.",
     ),
 ) -> None:
+    """Run a training manifest, or a base-model PFN from the marketplace.
+
+    `pfnstudio run runs/<slug>.yaml` executes that run via the configured (or
+    --target) compute adapter — the path the studio API and the self-hosted
+    runner spawn.
+
+    `pfnstudio run <slug>[:tag]` is the fastest way to see a PFN work, à la
+    `ollama run`: resolves the listing by slug (tag defaults to "latest") from
+    the public marketplace, pulls its adapter bundle from the marketplace and
+    its pretrained checkpoint from HuggingFace (both cached), writes a
+    lock.json next to the bundle pinning exactly what was resolved (one
+    `digest sha256:…` line — the same inputs always give the same digest), then
+    loads the model into the local daemon (`pfnstudio serve`, started on demand
+    like `ollama serve`) and runs a sample through it, printing the tasks it
+    supports and a live result. The model stays loaded for the next call. No
+    repo checkout needed; a checkout or --basemodels still takes precedence.
+    With no --input, it runs the adapter's built-in self-diagnostic on held-out
+    data, which proves the real weights load AND predict.
+
+    `pfnstudio run <name>` for a model made with `pfnstudio create` sends the
+    request to that model's run in the studio (it lives there, not locally).
+    """
+    # A path (an existing file, a .yaml/.yml name, or anything with a separator)
+    # is a run manifest; a name `create` wrote an alias for is a studio model;
+    # every other token is a marketplace model ref.
+    is_manifest = (
+        Path(what).is_file() or what.endswith((".yaml", ".yml")) or "/" in what or "\\" in what
+    )
+    if is_manifest:
+        _run_manifest(Path(what), project, target)
+    elif alias_path(what).is_file():
+        _run_alias(what, task, input_json)
+    else:
+        _run_model(what, api_url, basemodels, task, input_json, install_deps)
+
+
+def _run_manifest(manifest: Path, project: Path | None, target: str | None) -> None:
     """Execute a run via the configured (or overridden) compute adapter."""
     manifest = manifest.resolve()
     if project is None:
@@ -777,65 +978,19 @@ def run(
 
 
 @app.command()
-def serve(
-    manifest: Path = typer.Argument(..., help="Path to a run YAML."),
-    checkpoint: Path = typer.Option(
-        ..., help="Path to the checkpoint directory (contains model.pt + topology.json)."
-    ),
-    project: Path = typer.Option(None, help="Project root (default: parent of runs/)."),
-    host: str = typer.Option(
-        "127.0.0.1",
-        help="Bind address. Defaults to loopback — typically only the spawning process is the client.",
-    ),
-    port: int = typer.Option(
-        0,
-        help='TCP port to bind. 0 lets the OS pick a free port; the actual port is emitted in the {"event":"ready"} stdout line.',
-    ),
-) -> None:
-    """Load a trained checkpoint once and serve predictions over HTTP.
-
-    The self-hosted runner spawns one of these per Deployment, watches
-    stdout for the structured event stream
-    (``{"event":"starting"|"ready"|"error"|"shutdown",...}``), and
-    forwards predict calls to ``POST /predict`` on the reported port.
-
-    Endpoints:
-      - GET  /healthz → ``{"status":"ready"}``
-      - POST /predict → same JSON shape as the ``predict`` subcommand
-
-    Blocks until SIGTERM/SIGINT; emits a final shutdown event and
-    exits cleanly. A loader failure exits with code 1 after emitting
-    ``{"event":"error","stage":"load",...}``.
-    """
-    import sys as _sys
-
-    manifest = manifest.resolve()
-    if project is None:
-        project = manifest.parent.parent if manifest.parent.name == "runs" else Path.cwd()
-    project = project.resolve()
-
-    # Lazy import — keeps torch / serving deps out of the lightweight
-    # CLI commands' import path (init / validate / lint).
-    try:
-        from pfnstudio_core.serving import serve as _serve
-    except ImportError as e:
-        _sys.stderr.write(f"serving module unavailable: {e}\n")
-        raise typer.Exit(code=1) from e
-
-    _serve(
-        manifest_path=manifest,
-        project_root=project,
-        checkpoint_dir=checkpoint.resolve(),
-        host=host,
-        port=port,
-    )
-
-
-@app.command()
 def predict(
     manifest: Path = typer.Argument(..., help="Path to a run YAML."),
-    checkpoint: Path = typer.Option(
-        ..., help="Path to the checkpoint directory (contains model.pt + topology.json)."
+    checkpoint: str = typer.Option(
+        ...,
+        help=(
+            "Checkpoint reference. One of: (a) absolute local path to a "
+            "directory containing model.pt + topology.json, (b) a single "
+            "HF URI like hf://OWNER/REPO/PATH, or (c) a JSON-encoded "
+            "manifest object mapping local filenames to URIs. The studio "
+            "API passes (c) when the catalog template ships a multi-file "
+            "checkpoint published on HuggingFace; see "
+            "serving/hf.py:resolve_checkpoint for the full grammar."
+        ),
     ),
     input_json: Path = typer.Option(
         None,
@@ -895,11 +1050,51 @@ def predict(
     # field with the detector's per-axis proposal.
     detect_flag = bool(payload.pop("detect", False)) if isinstance(payload, dict) else False
 
+    # Resolve --checkpoint into a local directory. For plain filesystem
+    # paths this is a no-op; for HF URIs / manifests it pulls (and
+    # caches) the files into ~/.cache/pfnstudio/checkpoints/... before
+    # the predict module can load them. The resolver is the single
+    # entrypoint that knows about all the catalog-supported forms.
+    try:
+        from pfnstudio_core.serving.hf import resolve_checkpoint
+    except ImportError as e:
+        console.print_json(_json.dumps({"error": f"checkpoint resolver unavailable: {e}"}))
+        raise typer.Exit(code=1) from e
+
+    # A capabilities request answers a static manifest BEFORE any weights are
+    # loaded, so it needs no checkpoint. Skip the resolve — otherwise a private
+    # or unpublished HF checkpoint the caller can't pull (e.g. a self-hosted
+    # runner without the org's HF token) would 404 here and the Try-it /
+    # Inference surfaces would fall back to the legacy form even though the
+    # adapter can describe its tasks perfectly well. Pass the raw path through
+    # unresolved; the capabilities branch never reads it.
+    is_capabilities = isinstance(payload, dict) and payload.get("__capabilities__")
+    if is_capabilities:
+        resolved_checkpoint_dir = Path(str(checkpoint))
+    else:
+        try:
+            resolved_checkpoint_dir = resolve_checkpoint(checkpoint)
+        except Exception as e:
+            console.print_json(
+                _json.dumps(
+                    {
+                        "error": (
+                            f"could not resolve checkpoint: {type(e).__name__}: {e}. "
+                            "If the catalog template references an unpublished "
+                            "checkpoint (e.g. hf://<org>/<repo>/<file-not-yet-uploaded>), "
+                            "the Solution authors need to finish training and "
+                            "upload to HuggingFace before this Solution can run."
+                        ),
+                    }
+                )
+            )
+            raise typer.Exit(code=1) from e
+
     try:
         out = run_inference(
             manifest_path=manifest,
             project_root=project,
-            checkpoint_dir=checkpoint.resolve(),
+            checkpoint_dir=resolved_checkpoint_dir,
             payload=payload,
             tag=tag,
             detect=detect_flag,
@@ -917,6 +1112,645 @@ def predict(
     # Emit ONLY the JSON output on stdout so the API can parse it
     # cleanly. Anything else (progress, logs) should go on stderr.
     _sys.stdout.write(_json.dumps(out) + "\n")
+    _sys.stdout.flush()
+
+
+def _fetch_basemodel_bundle(api_base: str, slug: str, fm_project: str) -> Path:
+    """Pull basemodels/<fmProject>/ (adapter, yaml, requirements) from the public
+    marketplace and lay it out under the local basemodels cache — the same move
+    `run` already makes for the checkpoint, so no checkout is needed. Returns the
+    fm-project dir. Every entry's path is validated before it is written."""
+    import os
+
+    import requests
+
+    resp = requests.get(f"{api_base}/marketplace/basemodels/{slug}/bundle", timeout=30)
+    resp.raise_for_status()
+    bundle = resp.json()
+    files = bundle.get("files") if isinstance(bundle, dict) else None
+    if not isinstance(files, list) or not files:
+        raise RuntimeError("the marketplace returned an empty bundle")
+    cache_root = Path(
+        os.environ.get(
+            "PFNSTUDIO_BASEMODELS_CACHE",
+            str(Path.home() / ".cache" / "pfnstudio" / "basemodels"),
+        )
+    )
+    safe = "".join(ch for ch in fm_project if ch.isalnum() or ch in "._-")
+    if not safe or safe in (".", "..") or ".." in safe:
+        raise RuntimeError(f"invalid fmProject id: {fm_project!r}")
+    dest = (cache_root / safe).resolve()
+    dest.mkdir(parents=True, exist_ok=True)
+    for entry in files:
+        rel = str((entry or {}).get("path") or "")
+        content = (entry or {}).get("content")
+        p = Path(rel)
+        if not rel or p.is_absolute() or ".." in p.parts or not isinstance(content, str):
+            raise RuntimeError(f"refusing unsafe bundle entry: {rel!r}")
+        target = (dest / p).resolve()
+        if target != dest and dest not in target.parents:
+            raise RuntimeError(f"refusing bundle entry outside the cache: {rel!r}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    return dest
+
+
+def _find_basemodels_dir(fm_project: str, override: Path | None) -> Path | None:
+    """Locate the on-disk fm-project (basemodels/<fmProject>/) that carries the
+    adapter needed to run a base model. Order: explicit --basemodels override →
+    walk up from cwd looking for basemodels/<fmProject>. Returns the fm-project
+    dir or None when it can't be found (a pip-installed CLI outside a checkout)."""
+    if override is not None:
+        cand = override / fm_project
+        return cand if (cand / "adapters").is_dir() or cand.is_dir() else None
+    here = Path.cwd().resolve()
+    for base in [here, *here.parents]:
+        cand = base / "basemodels" / fm_project
+        if cand.is_dir():
+            return cand
+    return None
+
+
+def _run_model(
+    ref: str,
+    api_url: str,
+    basemodels: Path | None,
+    task: str | None,
+    input_json: Path | None,
+    install_deps: bool,
+) -> None:
+    """The `pfnstudio run <slug>[:tag]` path: resolve listing → bundle →
+    checkpoint, pin them in lock.json, then run the adapter's sample through
+    the local daemon."""
+    import json as _json
+    import os as _os
+    import sys as _sys
+
+    import requests
+
+    def err(msg: str) -> None:
+        console.print(f"[red]{msg}[/red]")
+
+    try:
+        slug, tag = parse_model_ref(ref)
+    except ValueError as e:
+        err(str(e))
+        raise typer.Exit(code=1) from e
+
+    # 1) Resolve the listing from the public marketplace catalog.
+    base = api_url.rstrip("/")
+    try:
+        resp = requests.get(f"{base}/marketplace/listings", timeout=20)
+        resp.raise_for_status()
+        listings = resp.json()
+    except Exception as e:
+        err(f"Couldn't reach the marketplace at {base}/marketplace/listings: {e}")
+        raise typer.Exit(code=1) from e
+
+    base_models = [
+        x
+        for x in (listings if isinstance(listings, list) else [])
+        if isinstance(x, dict) and x.get("type") == "basemodel"
+    ]
+    listing = next((x for x in base_models if x.get("slug") == slug), None)
+    if listing is None:
+        err(f"No base model with slug '{slug}'.")
+        if base_models:
+            avail = ", ".join(sorted(str(x.get("slug")) for x in base_models))
+            console.print(f"[dim]Available base models:[/dim] {avail}")
+        raise typer.Exit(code=1)
+
+    title = str(listing.get("title") or slug)
+    console.print(f"\n[bold]{title}[/bold]")
+    if listing.get("tagline"):
+        console.print(f"[dim]{listing['tagline']}[/dim]")
+    if listing.get("paramsLabel"):
+        console.print(f"[dim]{listing['paramsLabel']}[/dim]")
+
+    fm_project = listing.get("fmProject")
+    adapter_name = listing.get("baseAdapter")
+    # Version tags: a listing may define them as a {tag: checkpointRef | null}
+    # map under "tags" (null = the listing's own checkpointRef). A plain list
+    # under "tags" is the catalog's topic tags, not versions — only "latest".
+    version_tags = listing.get("tags") if isinstance(listing.get("tags"), dict) else {}
+    available_tags = sorted({"latest", *version_tags})
+    if tag not in available_tags:
+        err(f"'{slug}' has no tag '{tag}'.")
+        console.print(f"[dim]Available tags:[/dim] {', '.join(available_tags)}")
+        raise typer.Exit(code=1)
+    checkpoint_ref = version_tags.get(tag) or listing.get("checkpointRef")
+    if not checkpoint_ref:
+        err("This base model has no checkpoint reference — nothing to pull.")
+        raise typer.Exit(code=1)
+
+    # 2) Locate the adapter (needed to describe + run the model): a checkout or
+    #    --basemodels first; otherwise pull the bundle from the marketplace.
+    fm_dir = _find_basemodels_dir(str(fm_project), basemodels) if fm_project else None
+    if fm_dir is None and fm_project:
+        try:
+            fm_dir = _fetch_basemodel_bundle(base, slug, str(fm_project))
+            console.print(f"[green]✓[/green] Adapter bundle cached at [bold]{fm_dir}[/bold]")
+        except Exception as e:
+            console.print(
+                f"[yellow]Couldn't fetch the adapter bundle from the marketplace:[/yellow] {e}"
+            )
+            fm_dir = None
+
+    # The checkpoint resolver + inference module live in core; import lazily so
+    # `pfnstudio --help` doesn't pay torch's import cost.
+    try:
+        from pfnstudio_core.serving.hf import resolve_checkpoint
+    except ImportError as e:
+        err(f"checkpoint resolver unavailable: {e}")
+        raise typer.Exit(code=1) from e
+
+    ref_arg = (
+        _json.dumps(checkpoint_ref) if isinstance(checkpoint_ref, dict) else str(checkpoint_ref)
+    )
+
+    if fm_dir is None:
+        # No adapter on disk — we can still pull the weights so they're cached,
+        # but running needs the adapter. Tell the user exactly how to get it.
+        console.print(
+            "\n[yellow]Adapter not found locally[/yellow] — pulling the checkpoint anyway."
+        )
+        try:
+            ckpt = resolve_checkpoint(ref_arg)
+        except Exception as e:
+            err(f"Couldn't resolve checkpoint: {type(e).__name__}: {e}")
+            raise typer.Exit(code=1) from e
+        console.print(f"[green]✓[/green] Checkpoint cached at [bold]{ckpt}[/bold]")
+        console.print(
+            "\nTo RUN it, point --basemodels at a checkout that has "
+            f"[bold]basemodels/{fm_project}/[/bold] (the adapter), then re-run:\n"
+            f"  [dim]pfnstudio run {slug}:{tag} --basemodels /path/to/basemodels[/dim]"
+        )
+        return
+
+    # 2b) Upstream model package — only on request.
+    req_file = fm_dir / "requirements.txt"
+    if install_deps and req_file.is_file() and req_file.read_text(encoding="utf-8").strip():
+        import subprocess as _subprocess
+
+        console.print(f"[dim]Installing adapter dependencies from {req_file}…[/dim]")
+        _subprocess.check_call([_sys.executable, "-m", "pip", "install", "-r", str(req_file)])
+
+    # 3) Resolve the checkpoint into a local dir (pulls + caches from HF).
+    console.print("\n[dim]Pulling checkpoint…[/dim]", style=None)
+    try:
+        ckpt_dir = resolve_checkpoint(ref_arg)
+    except Exception as e:
+        err(f"Couldn't resolve checkpoint: {type(e).__name__}: {e}")
+        raise typer.Exit(code=1) from e
+
+    # 3b) Pin what was resolved: hash the bundle + weights into lock.json next
+    #     to the bundle and print the one-line digest (same inputs → same digest).
+    lock = build_lock(
+        slug=slug,
+        tag=tag,
+        fm_project=str(fm_project),
+        base_adapter=adapter_name,
+        bundle_dir=fm_dir,
+        checkpoint_dir=ckpt_dir,
+        checkpoint_ref=checkpoint_ref,
+    )
+    lock_path = write_lock(fm_dir, lock)
+    console.print(f"[green]✓[/green] Lock written to [bold]{lock_path}[/bold]")
+    _sys.stdout.write(f"digest {lock['digest']}\n")
+    _sys.stdout.flush()
+
+    # 4) Load it into the local daemon (started on demand, like `ollama serve`)
+    #    and talk to it over HTTP — the CLI is a client, never a model host.
+    #    The daemon resolves the same caches this command just filled, so the
+    #    load is a weights load, not a second download. A fresh daemon inherits
+    #    this command's --api-url / --basemodels through the environment; one
+    #    that is already running keeps the settings it started with.
+    from . import client
+
+    _os.environ["PFNSTUDIO_API_URL"] = base
+    if basemodels is not None:
+        _os.environ["PFNSTUDIO_BASEMODELS_DIR"] = str(basemodels)
+
+    def daemon_err(prefix: str, e: Exception) -> None:
+        detail = e.detail if isinstance(e, client.DaemonError) else None
+        if isinstance(detail, dict):
+            err(f"{prefix}: {detail.get('detail') or detail.get('error') or detail}")
+            if detail.get("error") == "missing_dependency":
+                console.print(
+                    "[dim]Install the adapter's upstream package into the daemon's Python:[/dim]\n"
+                    f"  pip install -r {fm_dir / 'requirements.txt'}\n"
+                    "[dim]or re-run with[/dim] --install-deps[dim]; a daemon that was already "
+                    "running needs a restart to see new packages.[/dim]"
+                )
+            elif detail.get("hint"):
+                console.print(f"[dim]{detail['hint']}[/dim]")
+        else:
+            err(f"{prefix}: {detail if detail is not None else e}")
+
+    try:
+        client.ensure_running()
+    except RuntimeError as e:
+        err(f"local daemon unavailable: {e}")
+        raise typer.Exit(code=1) from e
+
+    console.print(f"\n[dim]Loading into the daemon at {client.base_url()}…[/dim]")
+    try:
+        info = client.load(f"{slug}:{tag}")
+    except (client.DaemonError, Exception) as e:
+        daemon_err("load failed", e)
+        raise typer.Exit(code=1) from e
+    state = "already loaded" if info.get("already_loaded") else "loaded"
+    console.print(f"[green]✓[/green] {slug} {state} at {client.base_url()}/models/{slug}/")
+
+    # 4a) Capabilities — what tasks does this model support?
+    try:
+        caps_body = client.capabilities(slug)
+    except Exception as e:
+        daemon_err("capabilities failed", e)
+        raise typer.Exit(code=1) from e
+    caps_result = (
+        caps_body.get("result") if isinstance(caps_body.get("result"), dict) else caps_body
+    )
+    caps = caps_result.get("capabilities") if isinstance(caps_result, dict) else None
+    caps = caps if isinstance(caps, dict) else {}
+    if caps:
+        console.print(f"\n[bold]Tasks[/bold] ({len(caps)}):")
+        for key, spec in caps.items():
+            label = (spec or {}).get("label") or key
+            console.print(f"  • [cyan]{key}[/cyan] — {label}")
+    chosen = task or (next(iter(caps)) if caps else None)
+
+    # 4b) Run it. --input if given, else the adapter's self-diagnostic
+    #     (empty inputs → the adapter samples a held-out task and reports
+    #     predicted-vs-oracle, proving the real weights work).
+    if input_json is not None:
+        payload = _json.loads(input_json.read_text())
+    elif chosen:
+        payload = {"task": chosen}
+    else:
+        payload = {}
+
+    console.print(f"\n[dim]Running{f' {chosen}' if chosen else ''}…[/dim]")
+    try:
+        out = client.predict(slug, payload)
+    except Exception as e:
+        daemon_err("inference failed", e)
+        raise typer.Exit(code=1) from e
+
+    _print_model_result(out)
+
+
+def _print_model_result(out: dict) -> None:
+    """Shared tail of the model and alias forms of `run`: the result JSON on
+    stdout, or the model's own error with the --input hint."""
+    import json as _json
+    import sys as _sys
+
+    result = out.get("result", out) if isinstance(out, dict) else out
+    if isinstance(result, dict) and result.get("error"):
+        console.print(f"[red]model returned an error: {result['error']}[/red]")
+        console.print(
+            "[dim]Some adapters need real input data — pass one with "
+            "--input <payload.json> (same shape the web Try-it posts).[/dim]"
+        )
+        raise typer.Exit(code=1)
+
+    console.print("\n[green]✓ Result[/green]")
+    _sys.stdout.write(_json.dumps(result, indent=2) + "\n")
+    _sys.stdout.flush()
+
+
+def _run_alias(name: str, task: str | None, input_json: Path | None) -> None:
+    """The `pfnstudio run <name>` path for a model made with `pfnstudio create`.
+
+    `create` writes ~/.cache/pfnstudio/models/<name>.json pointing at the run it
+    composed in the studio; the model lives there (weights on the studio's
+    runner), so this sends the request to that run's predict endpoint with the
+    same token `create` used. Studio-side errors are reported as returned."""
+    import json as _json
+
+    from .create_cli import _request, _token
+
+    record = _json.loads(alias_path(name).read_text(encoding="utf-8"))
+    api = str(record.get("api") or "").rstrip("/")
+    pid, run_id = record.get("projectId"), record.get("runId")
+    if not (api and pid and run_id):
+        console.print(
+            f"[red]alias {alias_path(name)} is missing api/projectId/runId — re-create the model.[/red]"
+        )
+        raise typer.Exit(code=1)
+    src = record.get("from") or {}
+    console.print(
+        f"\n[bold]{name}[/bold] → run {run_id} in project {record.get('projectSlug') or pid}"
+    )
+    if src.get("slug"):
+        console.print(
+            f"[dim]FROM {src['slug']}:{src.get('tag') or 'latest'} digest {src.get('digest') or 'null'}[/dim]"
+        )
+
+    tok = _token(None)
+    runs = f"{api}/projects/{pid}/runs/{run_id}"
+    caps_body = _request("GET", f"{runs}/capabilities", token=tok)
+    caps_result = (
+        caps_body.get("result") if isinstance(caps_body.get("result"), dict) else caps_body
+    )
+    caps = caps_result.get("capabilities") if isinstance(caps_result, dict) else None
+    caps = caps if isinstance(caps, dict) else {}
+    if caps:
+        console.print(f"\n[bold]Tasks[/bold] ({len(caps)}):")
+        for key, spec in caps.items():
+            console.print(f"  • [cyan]{key}[/cyan] — {(spec or {}).get('label') or key}")
+    chosen = task or (next(iter(caps)) if caps else None)
+
+    if input_json is not None:
+        payload = _json.loads(input_json.read_text())
+    elif chosen:
+        payload = {"task": chosen}
+    else:
+        payload = {}
+
+    console.print(f"\n[dim]Running{f' {chosen}' if chosen else ''} in the studio…[/dim]")
+    # Inference blocks until the studio's runner answers; no client-side deadline.
+    out = _request("POST", f"{runs}/predict", token=tok, json=payload, timeout=None)
+    _print_model_result(out)
+
+
+@app.command()
+def serve(
+    manifest: Path = typer.Argument(
+        None,
+        help="Path to a run YAML — serve that one trained model (container / "
+        "Deployments form). Omit it to run the local model daemon instead.",
+    ),
+    checkpoint: Path = typer.Option(
+        None,
+        help="Path to the checkpoint directory (contains model.pt + topology.json). "
+        "Required with a manifest.",
+    ),
+    project: Path = typer.Option(
+        None, help="Project root (default: parent of runs/). Manifest form only."
+    ),
+    host: str = typer.Option(
+        "127.0.0.1",
+        help="Bind address. Defaults to loopback — only this machine's clients.",
+    ),
+    port: int = typer.Option(
+        0,
+        help="TCP port to bind. Manifest form: 0 lets the OS pick a free port, "
+        'emitted in the {"event":"ready"} stdout line. Daemon form: 0 means '
+        "the daemon's default 11440 (what `pfnstudio run` connects to).",
+    ),
+    keep_alive: float = typer.Option(
+        None,
+        "--keep-alive",
+        help="Daemon form only: seconds a loaded model may sit idle before it is "
+        "unloaded. Default: never — models stay until `pfnstudio rm` or exit.",
+    ),
+) -> None:
+    """Serve one trained model, or run the local model daemon.
+
+    With a manifest: load that checkpoint once and serve predictions over
+    HTTP. Used by the Deployments path and the model container: the studio
+    API spawns one of these per Deployment, watches stdout for the structured
+    event stream ({"event":"starting"|"ready"|"error"|"shutdown",...}), and
+    forwards user predict() calls to ``POST /predict`` on the reported port.
+    Blocks until SIGTERM/SIGINT; a loader failure exits with code 1 after
+    emitting {"event":"error","stage":"load",...}.
+
+    Without one: run the daemon in the foreground, à la `ollama serve` — one
+    process hosting many marketplace base models, each under
+    /models/<slug>/ with the container's exact API (/predict, /capabilities,
+    /mcp, /docs), plus /ps, /load and /unload for the CLI. `pfnstudio run`
+    starts this on demand when it is not already running.
+    """
+    import sys as _sys
+
+    if manifest is None:
+        from .daemon import DEFAULT_PORT, main  # lazy: fastapi/uvicorn only when serving
+
+        main(host, port or DEFAULT_PORT, keep_alive=keep_alive)
+        return
+    if checkpoint is None:
+        _sys.stderr.write("--checkpoint is required when serving a manifest\n")
+        raise typer.Exit(code=2)
+
+    manifest = manifest.resolve()
+    if project is None:
+        project = manifest.parent.parent if manifest.parent.name == "runs" else Path.cwd()
+    project = project.resolve()
+
+    # Lazy import — keeps torch / serving deps out of the lightweight
+    # CLI commands' import path (init / validate / lint).
+    try:
+        from pfnstudio_core.serving import serve as _serve
+    except ImportError as e:
+        _sys.stderr.write(f"serving module unavailable: {e}\n")
+        raise typer.Exit(code=1) from e
+
+    _serve(
+        manifest_path=manifest,
+        project_root=project,
+        checkpoint_dir=checkpoint.resolve(),
+        host=host,
+        port=port,
+    )
+
+
+@app.command("hf-push")
+def hf_push(
+    folder: Path = typer.Argument(..., help="Local folder to publish."),
+    repo_id: str = typer.Option(..., "--repo-id", help='"owner/repo-name" form.'),
+    revision: str = typer.Option("main", help="Branch to commit on."),
+    private: bool = typer.Option(True, "--private/--public", help="Private repo?"),
+    commit_message: str = typer.Option(
+        None, "--commit-message", help="Override the default commit message."
+    ),
+    token_env: str = typer.Option(
+        "HF_TOKEN",
+        help="Env var holding the HF write token. Passing the token via env "
+        "(instead of a flag) keeps it out of `ps` listings.",
+    ),
+) -> None:
+    """Publish a folder to a HuggingFace model repo.
+
+    Used by the Deployments promote flow: NestJS exports the trained
+    run's project tree + checkpoint to a local dir, then invokes this
+    command to mirror it into the user's HF account. Output JSON on
+    stdout: ``{"commit_sha": "...", "url": "..."}``.
+    """
+    import json as _json
+    import os as _os
+    import sys as _sys
+
+    token = _os.environ.get(token_env, "").strip()
+    if not token:
+        _sys.stderr.write(f"missing token in env var {token_env}\n")
+        raise typer.Exit(code=1)
+
+    try:
+        from pfnstudio_core.serving.hf import push_folder
+    except ImportError as e:
+        _sys.stderr.write(f"huggingface_hub not installed: {e}. Run: pip install pfnstudio[hf]\n")
+        raise typer.Exit(code=1) from e
+
+    try:
+        out = push_folder(
+            local_dir=folder.resolve(),
+            repo_id=repo_id,
+            token=token,
+            revision=revision,
+            private=private,
+            commit_message=commit_message,
+        )
+    except Exception as e:
+        _sys.stdout.write(_json.dumps({"error": f"{type(e).__name__}: {e}"}) + "\n")
+        _sys.stdout.flush()
+        raise typer.Exit(code=1) from e
+
+    _sys.stdout.write(_json.dumps(out) + "\n")
+    _sys.stdout.flush()
+
+
+@app.command("hf-pull")
+def hf_pull(
+    repo_id: str = typer.Argument(..., help='"owner/repo-name" form.'),
+    dest: Path = typer.Option(..., help="Local directory to materialize into."),
+    revision: str = typer.Option("main", help="Branch / commit to pull."),
+    token_env: str = typer.Option(
+        "HF_TOKEN",
+        help="Env var holding the HF read-or-write token. Private repos need a real token.",
+    ),
+) -> None:
+    """Materialize a HuggingFace model repo into a local directory.
+
+    Used by the deployment worker boot path: when artifactRef.kind == 'hf',
+    NestJS calls this command to populate the worker's workspace before
+    spawning `pfnstudio serve`.
+    """
+    import json as _json
+    import os as _os
+    import sys as _sys
+
+    token = _os.environ.get(token_env, "").strip()
+    if not token:
+        _sys.stderr.write(f"missing token in env var {token_env}\n")
+        raise typer.Exit(code=1)
+
+    try:
+        from pfnstudio_core.serving.hf import pull_snapshot
+    except ImportError as e:
+        _sys.stderr.write(f"huggingface_hub not installed: {e}. Run: pip install pfnstudio[hf]\n")
+        raise typer.Exit(code=1) from e
+
+    try:
+        out_dir = pull_snapshot(
+            repo_id=repo_id,
+            dest_dir=dest.resolve(),
+            token=token,
+            revision=revision,
+        )
+    except Exception as e:
+        _sys.stdout.write(_json.dumps({"error": f"{type(e).__name__}: {e}"}) + "\n")
+        _sys.stdout.flush()
+        raise typer.Exit(code=1) from e
+
+    _sys.stdout.write(_json.dumps({"dest": str(out_dir)}) + "\n")
+    _sys.stdout.flush()
+
+
+@app.command("resolve-checkpoint")
+def resolve_checkpoint_cmd(
+    ref: str = typer.Option(
+        ...,
+        help="checkpoint_ref: a local path, a single hf://OWNER/REPO/PATH URI, "
+        'or a JSON manifest map {"model.pt": "hf://…"}.',
+    ),
+    dest: Path = typer.Option(..., help="Local directory to materialize weights into."),
+    all_files: bool = typer.Option(
+        False,
+        "--all",
+        help=(
+            "Copy EVERY file in the resolved checkpoint instead of just "
+            "model.pt + topology.json. Required when the consumer is a base "
+            "model's own adapter (one that reads, say, model.safetensors "
+            "rather than model.pt) — see the command help."
+        ),
+    ),
+    token_env: str = typer.Option(
+        "HF_TOKEN",
+        help="Env var holding the HF read token (private base-model repos need it).",
+    ),
+) -> None:
+    """Resolve a base-model `checkpoint_ref` and stage it into `--dest`.
+
+    Two modes, because the two consumers want different things:
+
+      * default — stage `model.pt` (+ optional `topology.json`), flattening a
+        single-URI ref onto the trainer's expected name. NestJS's runner calls
+        this when a warm-start parent's checkpointPath is a remote ref (an
+        installed base model) rather than a local run directory, so the
+        training loop's `init_checkpoint/model.pt` loader works unchanged.
+
+      * ``--all`` — copy the resolved checkpoint verbatim. An adapter loads a
+        base model through its OWN architecture and reads whatever file names
+        that model publishes (e.g. `model.safetensors` rather than `model.pt`);
+        reducing the directory to `model.pt` silently strips what it needs.
+        The Deployments promote flow uses this so a served base model sees the
+        same bytes `pfnstudio predict` resolves for it.
+    """
+    import json as _json
+    import os as _os
+    import shutil as _shutil
+    import sys as _sys
+
+    token = _os.environ.get(token_env, "").strip() or None
+    try:
+        from pfnstudio_core.serving.hf import resolve_checkpoint
+
+        resolved_dir = resolve_checkpoint(ref, token=token)
+        dest.mkdir(parents=True, exist_ok=True)
+        staged: list[str] = []
+
+        if all_files:
+            # Verbatim copy. `dirs_exist_ok` so a re-resolve over a populated
+            # dest refreshes it rather than raising. A resolved checkpoint is a
+            # flat weights directory (no venv, no dataset), so there is nothing
+            # to prune here.
+            _shutil.copytree(resolved_dir, dest, dirs_exist_ok=True)
+            staged = sorted(p.name for p in dest.iterdir() if p.is_file())
+            if not staged:
+                raise FileNotFoundError(f"resolved checkpoint {resolved_dir} is empty")
+            _sys.stdout.write(_json.dumps({"dest": str(dest.resolve()), "files": staged}) + "\n")
+            _sys.stdout.flush()
+            return
+
+        # model.pt is required; topology.json is optional shape metadata.
+        src_model = resolved_dir / "model.pt"
+        if not src_model.exists():
+            # Single-URI refs land under the URI basename; take the first
+            # weights file in the resolved dir. Covers bare state_dicts (.pt)
+            # and Lightning/submitit checkpoints (.ckpt / .cpkt) — the trainer
+            # unwraps the container before loading.
+            cands = (
+                sorted(resolved_dir.glob("*.pt"))
+                + sorted(resolved_dir.glob("*.ckpt"))
+                + sorted(resolved_dir.glob("*.cpkt"))
+            )
+            if not cands:
+                raise FileNotFoundError(f"no weights (.pt/.ckpt/.cpkt) found under {resolved_dir}")
+            src_model = cands[0]
+        _shutil.copyfile(src_model, dest / "model.pt")
+        staged.append("model.pt")
+        src_topo = resolved_dir / "topology.json"
+        if src_topo.exists():
+            _shutil.copyfile(src_topo, dest / "topology.json")
+            staged.append("topology.json")
+    except Exception as e:
+        _sys.stdout.write(_json.dumps({"error": f"{type(e).__name__}: {e}"}) + "\n")
+        _sys.stdout.flush()
+        raise typer.Exit(code=1) from e
+
+    _sys.stdout.write(_json.dumps({"dest": str(dest.resolve()), "files": staged}) + "\n")
     _sys.stdout.flush()
 
 

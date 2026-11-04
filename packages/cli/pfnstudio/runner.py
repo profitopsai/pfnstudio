@@ -359,6 +359,69 @@ def _persist_checkpoint(
 # ── Phase 2: serve-lifecycle + predict polling ──────────────────────
 
 
+def _refresh_project_source(
+    base: str, headers: dict[str, str], deployment_id: str, run_id: str
+) -> None:
+    """Refresh the served run dir's SOURCE (adapters/priors/models/evals/blocks
+    + run.yaml) from the cloud's current project, preserving the local
+    checkpoint. Called before (re)spawning a serve subprocess.
+
+    Fixes the stale-served-adapter bug: RUNS_ROOT/<runId>/ source is persisted
+    once, at training completion, and never updated — so an adapter edited in
+    the studio AFTER training never reached serve (the training job bundle is
+    gone post-completion). The deployment bundle endpoint is a source-only
+    export NOT gated on the queue row, so serve always boots the current code.
+
+    Best-effort: on any failure keep the existing persisted source (serve still
+    boots, just possibly stale) rather than blocking the deployment.
+    """
+    run_dir = RUNS_ROOT / run_id
+    if not (run_dir / "checkpoint").is_dir():
+        return  # nothing persisted yet — _spawn_serve_for reports the missing ckpt
+    try:
+        r = requests.get(
+            f"{base}/runner/deployments/{deployment_id}/bundle",
+            headers=headers,
+            timeout=60,
+            stream=True,
+        )
+        if not r.ok:
+            return
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            tar_path = tmp_dir / "bundle.tar.gz"
+            with open(tar_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1 << 16):
+                    f.write(chunk)
+            extract_dir = tmp_dir / "x"
+            extract_dir.mkdir()
+            with tarfile.open(tar_path, "r:gz") as tf:
+                tf.extractall(extract_dir)  # nosec B202 — trusted cloud bundle
+            refreshed: list[str] = []
+            # Source dirs only — NEVER touch checkpoint/ (the runner's trained
+            # weights, which the bundle intentionally doesn't ship).
+            for sub in ("priors", "models", "evals", "runs", "adapters", "blocks"):
+                src = extract_dir / sub
+                if not src.is_dir():
+                    continue
+                dst = run_dir / sub
+                if dst.exists():
+                    shutil.rmtree(dst, ignore_errors=True)
+                shutil.copytree(str(src), str(dst))
+                refreshed.append(sub)
+            # Keep the top-level run.yaml (serve's --project manifest) in sync.
+            runs_dir = extract_dir / "runs"
+            yamls = sorted(runs_dir.glob("*.yaml")) if runs_dir.is_dir() else []
+            if yamls:
+                shutil.copy2(str(yamls[0]), str(run_dir / "run.yaml"))
+            if refreshed:
+                console.print(
+                    f"[dim]refreshed serve source for {run_id[-8:]} ({', '.join(refreshed)})[/dim]"
+                )
+    except Exception as e:
+        console.print(f"[dim]Could not refresh project source for {run_id[-8:]}: {e}[/dim]")
+
+
 def _spawn_serve_for(run_id: str, run_slug: str) -> tuple[subprocess.Popen[str], int] | None:
     """Boot a ``pfnstudio serve`` subprocess for one run on a random
     loopback port. Returns (proc, port) on success; None if the local
@@ -538,6 +601,11 @@ def _serve_manager_loop(
                                 run_slug = doc["id"]
                         except (OSError, yaml.YAMLError):
                             pass
+                    # Pull the CURRENT project source before serving so an
+                    # adapter edited in the studio after training takes effect
+                    # without a retrain (fixes the stale-served-adapter bug).
+                    # Best-effort — falls back to the persisted source on failure.
+                    _refresh_project_source(base, headers, dep_id, run_id)
                     spawned = _spawn_serve_for(run_id, run_slug)
                     if not spawned:
                         # Exponential cooldown so a broken artifact
@@ -1423,6 +1491,12 @@ def start(
         for pub in data.get("pendingPublishes") or []:
             _process_publish_request(base, headers, pub)
 
+        # Maintenance commands (e.g. reinstall a dependency) ride the same
+        # envelope. Run them inline BEFORE the job so an updated package is
+        # already in place for the trainer/serve subprocess that follows.
+        for cmd in data.get("pendingCommands") or []:
+            _process_runner_command(base, headers, cmd)
+
         if data.get("status") == "idle":
             if poll_idle_log_every_s > 0 and (time.time() - last_idle_log) >= poll_idle_log_every_s:
                 console.print("[dim]· still polling, no jobs queued[/dim]")
@@ -1662,6 +1736,76 @@ def _process_publish_request(base: str, headers: dict[str, str], pub: dict[str, 
         )
 
 
+def _report_command_result(
+    base: str,
+    headers: dict[str, str],
+    cmd_id: str,
+    status: str,
+    *,
+    result: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> None:
+    """POST a maintenance command's outcome so the cloud flips it done/failed."""
+    try:
+        requests.post(
+            f"{base}/runner/commands/{cmd_id}/result",
+            json={"status": status, "result": result, "error": error},
+            headers=headers,
+            timeout=30,
+        )
+    except requests.RequestException as e:
+        console.print(f"[yellow]Could not report command {cmd_id} result:[/yellow] {e}")
+
+
+def _process_runner_command(base: str, headers: dict[str, str], cmd: dict[str, Any]) -> None:
+    """Execute a maintenance command delivered in the poll envelope.
+
+    Currently one kind: ``reinstall_dependency`` — force-reinstall a pip
+    spec into THIS runner's venv (e.g. an updated base-model package
+    from a git ref). Runs ``pip install --force-reinstall --no-deps <spec>``
+    as a subprocess; ``--no-deps`` keeps it quick (torch/numpy already
+    present) and refreshes only the package code. The new code is picked up
+    by the NEXT job's trainer/serve subprocess with no daemon restart,
+    because the dependency is imported there, not in this long-lived loop.
+    """
+    cmd_id = cmd.get("id")
+    kind = cmd.get("kind", "reinstall_dependency")
+    spec = (cmd.get("spec") or "").strip()
+    if not isinstance(cmd_id, str) or not spec:
+        return
+    if kind != "reinstall_dependency":
+        console.print(f"[yellow]Unknown runner command kind '{kind}' — skipping.[/yellow]")
+        _report_command_result(base, headers, cmd_id, "error", error=f"unknown kind: {kind}")
+        return
+
+    console.print(f"[blue]→[/blue] reinstalling [bold]{spec}[/bold] into the runner venv…")
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps", spec],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        console.print(f"[yellow]reinstall failed:[/yellow] {type(exc).__name__}: {exc}")
+        _report_command_result(base, headers, cmd_id, "error", error=f"{type(exc).__name__}: {exc}")
+        return
+
+    out_tail = ((proc.stdout or "") + (proc.stderr or ""))[-1500:]
+    if proc.returncode == 0:
+        console.print(f"[green]✓[/green] reinstalled {spec} — effective on the next job.")
+        _report_command_result(
+            base, headers, cmd_id, "done", result={"spec": spec, "output_tail": out_tail}
+        )
+    else:
+        console.print(
+            f"[yellow]reinstall failed (pip exit {proc.returncode}):[/yellow] {out_tail[-300:]}"
+        )
+        _report_command_result(
+            base, headers, cmd_id, "error", error=f"pip exit {proc.returncode}: {out_tail}"
+        )
+
+
 def _run_job(
     base: str,
     headers: dict[str, str],
@@ -1688,18 +1832,38 @@ def _run_job(
         }
     )
 
-    # Heartbeat thread keeps the cloud's claim fresh while training runs.
+    # Heartbeat thread keeps the cloud's claim fresh while training
+    # runs, AND relays the cloud's cancel signal back to the main
+    # loop. When the operator clicks Cancel in Studio, the cloud
+    # flips Run.status to 'cancelled' and every subsequent heartbeat
+    # response carries `cancelled: true`. Without this the runner
+    # keeps training to completion no matter what Studio does —
+    # exactly the bug this block fixes.
     alive = threading.Event()
     alive.set()
+    cancelled_by_cloud = threading.Event()
 
     def _heartbeat() -> None:
         while alive.is_set():
             try:
-                requests.post(
+                resp = requests.post(
                     f"{base}/runner/jobs/{run_id}/heartbeat",
                     headers=headers,
                     timeout=10,
                 )
+                # Parse cancel signal. Older clouds (pre this fix)
+                # return {ok: true} with no cancelled field — treat
+                # as false, backward-compatible. Newer clouds return
+                # {ok: true, cancelled: <bool>}.
+                if resp.ok:
+                    try:
+                        body = resp.json()
+                        if isinstance(body, dict) and body.get("cancelled") is True:
+                            cancelled_by_cloud.set()
+                    except (ValueError, requests.exceptions.JSONDecodeError):
+                        # Non-JSON response — old cloud or proxy blip;
+                        # keep ticking, don't treat as cancel.
+                        pass
             except requests.RequestException:
                 # Transient — keep ticking; the cloud will reclaim the job
                 # if heartbeats lapse beyond HEARTBEAT_STALE_S.
@@ -1712,7 +1876,62 @@ def _run_job(
     hb_thread = threading.Thread(target=_heartbeat, daemon=True)
     hb_thread.start()
 
-    events_acc: list[dict[str, Any]] = []
+    # Events the cloud has not acknowledged. Streaming is best-effort — a
+    # POST that fails is NOT retried inline, because blocking here would
+    # stall the trainer on a network blip — so anything that didn't land
+    # stays here and rides along with the final result, where the cloud
+    # reconciles it into the log by stream position.
+    #
+    # Only the undelivered ones are kept. The previous implementation
+    # accumulated every event of the whole run and posted the entire array
+    # with the result: a 500k-step run meant a multi-hundred-megabyte
+    # request body against a 50 MB server limit.
+    unsent: list[dict[str, Any]] = []
+    # Extracted from the trainer's 'done' event so the cloud doesn't have to
+    # scan the log to find the run's metrics.
+    final_results: dict[str, Any] | None = None
+    # Outbound event batching. One HTTP round trip per event meant a
+    # 500k-step run made 500k POSTs, each one a synchronous stall in the loop
+    # that is reading the trainer's stdout — the trainer blocks on a full
+    # stdout pipe while we wait on the network, so the log was throttling the
+    # training. Batching amortises that to one request per BATCH_MAX events
+    # or FLUSH_EVERY_S seconds, whichever comes first, so progress still
+    # appears live.
+    BATCH_MAX = 200  # noqa: N806 — a constant, scoped to this loop
+    FLUSH_EVERY_S = 2.0  # noqa: N806
+    pending: list[dict[str, Any]] = []
+    last_flush = time.monotonic()
+    # Stream position, stamped on every event. The cloud stores it as the
+    # event's ordinal, which is what lets a re-sent batch reconcile against
+    # what already landed instead of duplicating it.
+    ord_next = 0
+
+    def _flush_events(force: bool = False) -> None:
+        nonlocal pending, last_flush
+        if not pending:
+            return
+        if (
+            not force
+            and len(pending) < BATCH_MAX
+            and (time.monotonic() - last_flush) < FLUSH_EVERY_S
+        ):
+            return
+        batch, pending = pending, []
+        last_flush = time.monotonic()
+        try:
+            resp = requests.post(
+                f"{base}/runner/jobs/{run_id}/events",
+                json={"events": batch},
+                headers=headers,
+                timeout=10,
+            )
+            if resp.status_code >= 400:
+                unsent.extend(batch)
+        except requests.RequestException:
+            # Keep it for the final reconciliation rather than retrying here;
+            # retrying inline is what would stall the trainer.
+            unsent.extend(batch)
+
     final_status = "failed"
     final_error: dict[str, Any] | None = None
     proc: subprocess.Popen[str] | None = None
@@ -1754,6 +1973,81 @@ def _run_job(
         # JSON-line events on stdout, which we pipe up to /events.
         env = os.environ.copy()
         env["PFNSTUDIO_JSON_PROGRESS"] = "1"
+        # Snapshot straight into this run's durable directory instead of the
+        # disposable bundle. The bundle is a temp dir that gets rmtree'd on
+        # the way out — and never gets that far at all if this process is
+        # killed or the box loses power, which is precisely when a
+        # mid-training checkpoint is the thing you wanted. Writing here means
+        # the snapshots outlive the workspace, and the next attempt at this
+        # run resumes from them.
+        durable_ckpt = RUNS_ROOT / run_id / "checkpoint"
+        try:
+            durable_ckpt.mkdir(parents=True, exist_ok=True)
+            env["PFNSTUDIO_CHECKPOINT_DIR"] = str(durable_ckpt)
+
+            # Cross-box / cleaned-dir resume: if THIS box has no local
+            # snapshots for the run but the cloud shipped resume_checkpoint/ in
+            # the bundle (this run's own snapshots, staged studio-side from a
+            # prior attempt's uploaded checkpoint), seed the durable dir from it
+            # so the trainer continues from the last step instead of restarting
+            # on a fresh runner. Same-box re-runs already have the snapshots
+            # locally and skip this. The fingerprint check below still guards
+            # correctness — seeded snapshots from a genuinely different
+            # experiment get cleared just like local ones.
+            if not list(durable_ckpt.glob("model_step_*.pt")):
+                bundle_resume = work_root / "resume_checkpoint"
+                staged_snaps = (
+                    sorted(bundle_resume.glob("model_step_*.pt")) if bundle_resume.is_dir() else []
+                )
+                if staged_snaps:
+                    try:
+                        for f in bundle_resume.iterdir():
+                            if f.is_file():
+                                shutil.copy2(str(f), str(durable_ckpt / f.name))
+                        console.print(
+                            f"[blue]→[/blue] seeded {len(staged_snaps)} checkpoint "
+                            f"snapshot(s) from the cloud bundle into {durable_ckpt}"
+                        )
+                    except OSError as e:
+                        console.print(
+                            f"[yellow]Could not seed resume checkpoint from bundle: {e}[/yellow]"
+                        )
+
+            # Resume only into the same experiment. Snapshots left by an
+            # attempt with a different model or prior are cleared rather than
+            # resumed from — shapes can coincide, and silently continuing
+            # into weights that mean something else is worse than restarting.
+            fp_path = durable_ckpt / ".job-fingerprint"
+            fp_now = _job_fingerprint(job)
+            fp_prev = None
+            try:
+                fp_prev = fp_path.read_text().strip()
+            except OSError:
+                pass
+            snapshots = sorted(durable_ckpt.glob("model_step_*.pt"))
+            if fp_prev is not None and fp_prev != fp_now and snapshots:
+                console.print(
+                    "[yellow]Prior/model/hyperparams changed since the last "
+                    "attempt — discarding its checkpoints and starting from "
+                    "step 0.[/yellow]"
+                )
+                shutil.rmtree(durable_ckpt, ignore_errors=True)
+                durable_ckpt.mkdir(parents=True, exist_ok=True)
+            elif snapshots:
+                console.print(
+                    f"[blue]→[/blue] resuming from {len(snapshots)} local "
+                    f"checkpoint(s) in {durable_ckpt}"
+                )
+            try:
+                fp_path.write_text(fp_now)
+            except OSError:
+                pass
+        except OSError as e:
+            console.print(
+                f"[yellow]Could not create {durable_ckpt} ({e}) — checkpoints "
+                f"will stay in the job workspace and be lost if it is cleaned up."
+                "[/yellow]"
+            )
 
         # ── Resumable checkpoints ────────────────────────────────────────
         # Point the trainer at a DURABLE per-run checkpoint dir (keyed by run
@@ -1774,9 +2068,7 @@ def _run_job(
             if bundle_dir is not None and not list(durable_ckpt.glob("model_step_*.pt")):
                 bundle_resume = work_root / "resume_checkpoint"
                 staged_snaps = (
-                    sorted(bundle_resume.glob("model_step_*.pt"))
-                    if bundle_resume.is_dir()
-                    else []
+                    sorted(bundle_resume.glob("model_step_*.pt")) if bundle_resume.is_dir() else []
                 )
                 if staged_snaps:
                     try:
@@ -1789,8 +2081,7 @@ def _run_job(
                         )
                     except OSError as e:
                         console.print(
-                            f"[yellow]Could not seed resume checkpoint from bundle: {e}"
-                            "[/yellow]"
+                            f"[yellow]Could not seed resume checkpoint from bundle: {e}[/yellow]"
                         )
 
             # Resume only into the same experiment: snapshots left by an attempt
@@ -1871,23 +2162,19 @@ def _run_job(
                     raise ValueError("not an event")
             except (json.JSONDecodeError, ValueError):
                 ev = {"event": "log", "line": line, "ts": _ts()}
-            # Scrub NaN/Inf so a single bad metric can't make the event
-            # (or the final result post that re-sends events_acc) fail to
-            # serialize and lose the whole run report.
+            # Scrub NaN/Inf so a single bad metric can't make the event (or the
+            # final result post) fail to serialize and lose the run report.
             ev = _json_safe(ev)
-            events_acc.append(ev)
+            ev["ord"] = ord_next
+            ord_next += 1
+            pending.append(ev)
+            _flush_events()
 
-            # Best-effort stream — don't block the trainer if the cloud
-            # is briefly unreachable.
-            try:
-                requests.post(
-                    f"{base}/runner/jobs/{run_id}/events",
-                    json={"events": [ev]},
-                    headers=headers,
-                    timeout=5,
-                )
-            except requests.RequestException:
-                pass
+            if ev.get("event") == "done":
+                # The trainer's metrics payload. Captured here so the result
+                # POST can carry it explicitly — the cloud used to have to
+                # rediscover it by scanning the whole event array.
+                final_results = {k: v for k, v in ev.items() if k not in ("ord",)}
 
             if ev.get("event") == "finished":
                 final_status = ev.get("status", "completed")
@@ -1902,6 +2189,25 @@ def _run_job(
                     pass
                 final_status = "cancelled"
                 break
+
+            if cancelled_by_cloud.is_set():
+                # Studio's Cancel button flipped Run.status to
+                # 'cancelled'; the heartbeat thread already saw it.
+                # Kill the trainer subprocess and report cancelled
+                # up to the cloud on the way out.
+                console.print(
+                    "[yellow]Cancel signalled by cloud — terminating in-flight training.[/yellow]"
+                )
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+                final_status = "cancelled"
+                break
+
+        # stdout is exhausted — push whatever is still buffered so the
+        # last steps show up before the run flips to terminal.
+        _flush_events(force=True)
 
         proc.wait()
         # If the trainer exited cleanly but didn't emit a 'finished'
@@ -1922,6 +2228,12 @@ def _run_job(
 
     finally:
         alive.clear()
+        # Anything still buffered (or buffered when an exception unwound the
+        # loop) has not reached the cloud — hand it to the reconciliation
+        # path rather than dropping it.
+        _flush_events(force=True)
+        unsent.extend(pending)
+        pending = []
         # Clear the currentJob marker so `runner status` reports idle
         # again. Done eagerly here so a stuck artifact upload below
         # doesn't make the status command keep showing this run as
@@ -1934,6 +2246,15 @@ def _run_job(
         # from runner →" in Studio later, which triggers an upload
         # via the long-poll publish-request channel.
         artifact_ref: dict[str, Any] | None = None
+        # Persist on ANY terminal status, not only success. A failed or
+        # cancelled run is exactly the case where the mid-training snapshots
+        # matter — they are what the next attempt resumes from. Gating this
+        # on "completed" meant a crash at step 373,896 of 500,000 had its
+        # snapshots deleted by the workspace cleanup below. Only the
+        # artifact_ref / signing work stays completed-only: a failed run has
+        # no final model.pt to publish.
+        if bundle_dir is not None and final_status != "completed":
+            _persist_checkpoint(bundle_dir, run_id, run_slug, base)
         if final_status == "completed" and bundle_dir is not None:
             persisted = _persist_checkpoint(bundle_dir, run_id, run_slug, base)
             if persisted is not None:
@@ -1971,12 +2292,18 @@ def _run_job(
         # 'running' until the next requeue sweep.
         result_body: dict[str, Any] = {
             "status": final_status,
-            "events": events_acc,
+            # ONLY the events the cloud never acknowledged. It reconciles
+            # them into the log by their "ord". Sending the full accumulated
+            # array here — as this used to — meant a request body that grew
+            # with the run and eventually exceeded the server's limit.
+            "events": unsent,
             "error": final_error,
         }
+        if final_results is not None:
+            result_body["results"] = final_results
         if artifact_ref is not None:
             result_body["artifactRef"] = artifact_ref
-        result_body = _json_safe(result_body)
+            result_body = _json_safe(result_body)
         for attempt in range(2):
             try:
                 requests.post(

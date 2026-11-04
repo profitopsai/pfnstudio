@@ -19,8 +19,9 @@ the concrete adapters, so registration stays lazy (import-on-use).
 from __future__ import annotations
 
 import importlib
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 
 @runtime_checkable
@@ -64,7 +65,9 @@ class Adapter(Protocol):
         `load_model` for further continued pretraining."""
         ...
 
-    def predict(self, model: Any, payload: dict[str, Any], hp: dict[str, Any], device: Any) -> dict[str, Any]:
+    def predict(
+        self, model: Any, payload: dict[str, Any], hp: dict[str, Any], device: Any
+    ) -> dict[str, Any]:
         """OPTIONAL. Run inference through the base model's own architecture +
         real weights (the `model` returned by `load_model`). This is what makes
         "install a base model → Predict" use the actual pretrained weights
@@ -113,7 +116,13 @@ def resolve_adapter(name: str, adapter_module: str | None) -> Adapter:
     """Resolve the adapter for `name`. If not already registered (e.g. by
     `discover_in_project`), import the declared `adapter_module` (which
     self-registers via @register_adapter), else fall back to the bundled
-    reference adapter `...training.adapters.<name>`."""
+    reference adapter `...training.adapters.<name>`.
+
+    Registry-first is load-bearing: adapters authored in a project
+    (`adapters/<name>.py`) are registered by `discover_in_project`, which
+    re-execs the file on every call — so their code changes are already picked
+    up without a restart. Importing a bundled `...training.adapters.<name>`
+    module for those would raise ModuleNotFoundError (no such module exists)."""
     from pfnstudio_core.registry import get_adapter
 
     try:
@@ -163,7 +172,7 @@ def run_adapter_training(
     try:
         model = adapter.load_model(ckpt_dir, hp, device)
         model.train()
-    except Exception as e:  # noqa: BLE001 — surface as a run error, not a crash
+    except Exception as e:
         # Disambiguate the adapter's NAME from a missing dependency PACKAGE:
         # e.g. the 'tcpfn' adapter needing the (separate) 'tcpfn' Python
         # package. Without this, "adapter tcpfn: No module named 'tcpfn'"
@@ -198,7 +207,7 @@ def run_adapter_training(
         _prior_id = getattr(getattr(run, "prior", None), "id", None)
         if _prior_id:
             prior_instance = get_prior(_prior_id)()
-    except Exception:  # noqa: BLE001 — prior is optional; adapter may not use it
+    except Exception:
         prior_instance = None
 
     import inspect as _inspect
@@ -208,7 +217,9 @@ def run_adapter_training(
     else:
         sampler = adapter.make_sampler(hp, device)
 
-    emit_log(f"the '{adapter_name}' adapter: continuing pretraining for {steps} steps (seed {seed}) …")
+    emit_log(
+        f"the '{adapter_name}' adapter: continuing pretraining for {steps} steps (seed {seed}) …"
+    )
     emit_event("start", steps=steps, adapter=adapter_name)
 
     losses: list[float] = []
@@ -225,7 +236,7 @@ def run_adapter_training(
             losses.append(lv)
             if step % log_every == 0 or step == steps - 1:
                 emit_event("step", step=step, loss=lv)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         return {
             "status": "error",
             "reason": f"the '{adapter_name}' adapter: training step failed at step {len(losses)} — {type(e).__name__}: {e}",
@@ -235,10 +246,13 @@ def run_adapter_training(
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
         adapter.save(model, out_dir, hp, steps)
-    except Exception as e:  # noqa: BLE001
-        return {"status": "error", "reason": f"the '{adapter_name}' adapter: checkpoint save failed — {type(e).__name__}: {e}"}
+    except Exception as e:
+        return {
+            "status": "error",
+            "reason": f"the '{adapter_name}' adapter: checkpoint save failed — {type(e).__name__}: {e}",
+        }
 
-    tail = losses[-max(1, steps // 10):] if losses else []
+    tail = losses[-max(1, steps // 10) :] if losses else []
     results = {
         "status": "ok",
         "adapter": adapter_name,

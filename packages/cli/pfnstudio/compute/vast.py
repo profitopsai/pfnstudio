@@ -526,22 +526,44 @@ def _format_offers_table(offers: list[dict[str, Any]]) -> str:
 def _provision_instance(api_key: str, offer_id: int, cfg: dict[str, Any]) -> dict[str, Any]:
     """Provision the chosen offer. Returns the new instance descriptor
     (which includes the assigned instance_id we use for follow-ups)."""
-    body = {
-        "client_id": "me",
-        "image": cfg["image"],
-        "disk": cfg["disk_gb"],
-        # `onstart_cmd` runs once when the container first boots. We don't
-        # use it for the real work (SSH-exec is easier to monitor), but a
-        # no-op pause keeps the container alive past image entrypoint.
-        "onstart_cmd": "tail -f /dev/null",
-        "runtype": "ssh",
-    }
+    template_hash_id = (
+        os.environ.get("VAST_TEMPLATE_HASH_ID") or cfg.get("template_hash_id") or ""
+    ).strip()
+    if template_hash_id:
+        body = {
+            "client_id": "me",
+            "template_hash_id": template_hash_id,
+            "disk": cfg["disk_gb"],
+        }
+    else:
+        body = {
+            "client_id": "me",
+            "image": cfg["image"],
+            "disk": cfg["disk_gb"],
+            # `onstart_cmd` runs once when the container first boots. We don't
+            # use it for the real work (SSH-exec is easier to monitor), but a
+            # no-op pause keeps the container alive past image entrypoint.
+            "onstart_cmd": "tail -f /dev/null",
+            "runtype": "ssh",
+        }
     return _vast_put(f"/asks/{offer_id}/", api_key, body)
+
+
+def vast_proxy_ssh_port(raw_ssh_port: int) -> int:
+    """Vast quirk: the `ssh_port` field in /instances/{id}/ is the proxy
+    SSH port minus 1. Confirmed empirically — Vast's UI shows
+    "Proxy ssh connect: ssh -p N root@sshX.vast.ai" while the API returns
+    `ssh_port: N-1`; TCP-connect tests confirmed port N-1 closes the
+    connection mid-handshake while port N reaches the auth phase. Kept in
+    sync with the same adjustment in organizations.service.ts."""
+    return raw_ssh_port + 1
 
 
 def _wait_for_ssh(api_key: str, instance_id: int, timeout_s: int = 600) -> dict[str, Any]:
     """Poll until the instance is running and has an SSH endpoint. Returns
-    the instance descriptor with `ssh_host` and `ssh_port` populated."""
+    the instance descriptor with `ssh_host` and `ssh_port` populated
+    (`ssh_port` already adjusted to the real proxy port — see
+    `vast_proxy_ssh_port`)."""
     deadline = time.time() + timeout_s
     backoff = 5
     while time.time() < deadline:
@@ -552,6 +574,7 @@ def _wait_for_ssh(api_key: str, instance_id: int, timeout_s: int = 600) -> dict[
             ssh_host = inst.get("ssh_host") or inst.get("public_ipaddr")
             ssh_port = inst.get("ssh_port")
             if status == "running" and ssh_host and ssh_port:
+                inst["ssh_port"] = vast_proxy_ssh_port(int(ssh_port))
                 return inst
         time.sleep(backoff)
         backoff = min(backoff + 2, 15)
@@ -700,17 +723,17 @@ def _wait_for_ssh_connection(
 
 
 def _make_project_tarball(project_root: Path) -> Path:
-    """Bundle the project root plus the priorstudio packages it needs.
+    """Bundle the project root plus the pfnstudio packages it needs.
 
     We ship the local pfnstudio-core + pfnstudio CLI packages alongside
     the project so the remote doesn't have to pip-install from a registry
-    (priorstudio isn't on PyPI yet). Skips heavy dirs we don't need on the
+    (pfnstudio isn't on PyPI yet). Skips heavy dirs we don't need on the
     remote (node_modules, .venv, dist, .git)."""
-    tmp = Path(tempfile.mkstemp(suffix=".tgz", prefix="priorstudio-vast-")[1])
+    tmp = Path(tempfile.mkstemp(suffix=".tgz", prefix="pfnstudio-vast-")[1])
     tmp.unlink()  # mkstemp creates an empty file; we want tarfile to make a fresh one
 
-    # priorstudio-cloud root is six levels up from this file:
-    #   .../priorstudio-cloud/packages/cli/priorstudio/compute/vast.py
+    # pfnstudio-cloud root is six levels up from this file:
+    #   .../pfnstudio-cloud/packages/cli/pfnstudio/compute/vast.py
     cli_root = Path(__file__).resolve().parents[4]
     pkg_core = cli_root / "packages" / "core"
     pkg_cli = cli_root / "packages" / "cli"
@@ -737,7 +760,7 @@ def _make_project_tarball(project_root: Path) -> Path:
         if pkg_core.exists():
             tf.add(pkg_core, arcname="pfnstudio-core", filter=_filter)
         if pkg_cli.exists():
-            tf.add(pkg_cli, arcname="priorstudio-cli", filter=_filter)
+            tf.add(pkg_cli, arcname="pfnstudio-cli", filter=_filter)
     return tmp
 
 
@@ -811,7 +834,7 @@ def _ssh_stream(
     """Run a command over SSH, streaming stdout/stderr line-by-line back
     to our own stdout. When `forward_events` is True, lines that parse as
     valid JSON events are re-emitted as-is (so progress events from the
-    remote priorstudio run flow to the API runner unchanged); other lines
+    remote pfnstudio run flow to the API runner unchanged); other lines
     are wrapped in a `log` event. Returns the remote exit code."""
     cmd = ["ssh", *_ssh_base_args(ssh_key_path, ssh_host, ssh_port), command]
     proc = subprocess.Popen(
@@ -1096,15 +1119,48 @@ class VastAdapter(ComputeAdapter):
                 except Exception:
                     pass
 
-            # Untar + install priorstudio + project deps. The remote runs
+            # Untar + install pfnstudio + project deps. The remote runs
             # the local adapter with PFNSTUDIO_JSON_PROGRESS=1 so its
             # progress events flow to us unchanged.
+            #
+            # Blackwell self-heal: before installing OUR packages we
+            # check whether the image's PyTorch has a CUDA kernel for
+            # the rented card's compute capability. The image we ship
+            # (pytorch/pytorch:2.4.0-cuda12.1) was built before
+            # Blackwell (sm_100, sm_120) existed; renting an RTX 5070
+            # / 5080 / 5090 / B100 / B200 against that image gets the
+            # operator a 'CUDA error: no kernel image is available'
+            # crash inside model.to(device) on the first training
+            # step. The fix is a torch upgrade to the cu130 nightly
+            # which includes Blackwell kernels.
+            #
+            # We don't always upgrade — that would add ~60s + 2 GB of
+            # bandwidth to every Vast dispatch regardless of card.
+            # The check is cheap: grep torch.cuda.get_arch_list() for
+            # the rented card's sm_XX tag. On 3090/4090/A100/H100 the
+            # tag is already in the list and we skip; on Blackwell+
+            # we upgrade. SSH non-interactive sessions don't auto-
+            # activate conda, so we explicitly target the system
+            # python3 with --break-system-packages — which is what
+            # the rest of install_cmd uses too.
             run_rel = run_yaml.relative_to(project_root)
             install_cmd = (
                 "set -euo pipefail; "
                 "mkdir -p /workspace && cd /workspace && tar -xzf /workspace.tgz && "
-                "pip install --quiet -e ./pfnstudio-core -e ./priorstudio-cli && "
-                "if [ -f ./project/requirements.txt ]; then pip install --quiet -r ./project/requirements.txt; fi"
+                # ── Blackwell self-heal: detect missing CUDA kernel ────────
+                # The python3 -c command prints the card's sm_XX; the
+                # grep checks if torch was built for it. Both short-
+                # circuit if torch isn't importable (degenerate
+                # image — let the install below fail loudly).
+                "CARD_CAP=$(python3 -c 'import torch; c=torch.cuda.get_device_capability(0); print(f\"sm_{c[0]}{c[1]}\")' 2>/dev/null || echo ''); "
+                'if [ -n "$CARD_CAP" ] && ! python3 -c \'import torch; print(torch.cuda.get_arch_list())\' 2>/dev/null | grep -q "$CARD_CAP"; then '
+                '  echo "[vast] card needs $CARD_CAP, system torch missing it — upgrading torch (Blackwell+)."; '
+                "  python3 -m pip install --quiet --upgrade --break-system-packages --pre --force-reinstall torch --index-url https://download.pytorch.org/whl/nightly/cu130; "
+                "  echo \"[vast] torch upgrade done: $(python3 -c 'import torch; print(torch.__version__)')\"; "
+                "fi; "
+                # ── End Blackwell self-heal ──────────────────────────────
+                "python3 -m pip install --quiet -e ./pfnstudio-core -e ./pfnstudio-cli && "
+                "if [ -f ./project/requirements.txt ]; then python3 -m pip install --quiet -r ./project/requirements.txt; fi"
             )
             _emit("vast.installing")
             rc = _ssh_stream(cfg["ssh_key_path"], ssh_host, ssh_port, install_cmd)
@@ -1118,7 +1174,7 @@ class VastAdapter(ComputeAdapter):
             run_cmd = (
                 "set -euo pipefail; cd /workspace/project && "
                 "PFNSTUDIO_JSON_PROGRESS=1 "
-                f"priorstudio run '{run_rel}' --target local"
+                f"python3 -m pfnstudio run '{run_rel}' --target local"
             )
             _emit("vast.training_started")
             rc = _ssh_stream(cfg["ssh_key_path"], ssh_host, ssh_port, run_cmd, forward_events=True)

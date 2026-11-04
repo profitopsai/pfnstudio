@@ -34,6 +34,8 @@ ignore = [
 # default — re-evaluating per-invocation is the point.
 "packages/cli/pfnstudio/cli.py" = ["B008", "N806"]
 "packages/cli/pfnstudio/runner.py" = ["B008"]
+"packages/cli/pfnstudio/create_cli.py" = ["B008"]
+"packages/cli/pfnstudio/store_cli.py" = ["B008"]
 "starters/**/*.py" = ["N803", "N806", "RUF012"]
 
 [tool.pytest.ini_options]

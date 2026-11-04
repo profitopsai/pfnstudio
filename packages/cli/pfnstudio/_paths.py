@@ -1,7 +1,7 @@
 """Locate bundled schemas and templates.
 
 When running from source: look up the tree for `schemas/` and `templates/`.
-When pip-installed: look in `priorstudio/_bundled/` (populated by hatch at build time).
+When pip-installed: look in `pfnstudio/_bundled/` (populated by hatch at build time).
 """
 
 from __future__ import annotations

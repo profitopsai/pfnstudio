@@ -1,8 +1,8 @@
 """Modal.com compute adapter.
 
 Modal's Python SDK lets us define a remote function inline. The simplest model:
-import modal at submit-time, define an image with priorstudio installed, mount
-the project root, and call priorstudio.compute.local.LocalAdapter inside.
+import modal at submit-time, define an image with pfnstudio installed, mount
+the project root, and call pfnstudio.compute.local.LocalAdapter inside.
 """
 
 from __future__ import annotations
@@ -31,6 +31,6 @@ class ModalAdapter(ComputeAdapter):
             "run_yaml": str(run_yaml.relative_to(project_root)),
             "note": (
                 "Modal app definition needs a per-org image + secrets config. "
-                "Configure .priorstudio/modal.yaml — see docs/compute.md."
+                "Configure .pfnstudio/modal.yaml — see docs/compute.md."
             ),
         }
