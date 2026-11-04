@@ -16,7 +16,8 @@
 # A case passes only when the command exits 0 AND prints a result.
 #
 # Env: PYTHON (default python3, needs 3.10+), PFNSTUDIO_API_URL (marketplace,
-# default hosted), VERIFY_SITE, VERIFY_DIR (work dir, default a new temp dir;
+# default hosted), VERIFY_SITE, VERIFY_BASEMODELS (undeployed adapters, see
+# below), VERIFY_DIR (work dir, default a new temp dir;
 # kept afterwards for the logs), VERIFY_PORT (daemon port, default 11541 so a
 # daemon already on 11440 is never touched).
 #
@@ -44,6 +45,12 @@ export PFNSTUDIO_CHECKPOINT_CACHE="$WORK/cache/checkpoints"
 export PFNSTUDIO_DAEMON_LOG="$WORK/daemon.log"
 export HF_HOME="$WORK/cache/hf"
 unset PFNSTUDIO_BASEMODELS_DIR PFNSTUDIO_SERVE_TOKEN
+# VERIFY_BASEMODELS=<dir holding <fmProject>/adapters/>: test adapters before
+# they are deployed. A model whose folder is not there still downloads its
+# bundle from the marketplace.
+if [[ -n "${VERIFY_BASEMODELS:-}" ]]; then
+  export PFNSTUDIO_BASEMODELS_DIR="$VERIFY_BASEMODELS"
+fi
 
 stop_daemon() { pkill -f "pfnstudio.daemon --host 127.0.0.1 --port $PORT" 2>/dev/null || true; }
 trap stop_daemon EXIT
@@ -124,7 +131,7 @@ for slug in "${SLUGS[@]}"; do
   inp="$WORK/inputs/$slug.json"
   b="SKIP no daemon"; c="-"
   if curl -fsS "$DAEMON/healthz" >/dev/null 2>&1; then
-    make_input "$slug" "$inp"
+    make_input "$slug" "$inp" 2>>"$WORK/logs/$slug.input.log"
     case $? in
       0)
         b=$(run_case "$WORK/logs/$slug.input.log" "$slug" --input "$inp")
