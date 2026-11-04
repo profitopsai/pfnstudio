@@ -1,0 +1,35 @@
+{
+  "task": "classify_relational",
+  "inputs": {
+    "tables": {
+      "customers": [
+        {"customer_id": 1, "region": "N", "churn": "yes"},
+        {"customer_id": 2, "region": "S", "churn": "no"},
+        {"customer_id": 3, "region": "N", "churn": "yes"},
+        {"customer_id": 4, "region": "S", "churn": null}
+      ],
+      "orders": [
+        {"order_id": 10, "customer_id": 1, "amount": 90.0},
+        {"order_id": 11, "customer_id": 1, "amount": 80.0},
+        {"order_id": 12, "customer_id": 2, "amount": 5.0},
+        {"order_id": 13, "customer_id": 3, "amount": 75.0},
+        {"order_id": 14, "customer_id": 4, "amount": 120.0}
+      ],
+      "payments": [
+        {"payment_id": 100, "order_id": 10, "amount": 90.0},
+        {"payment_id": 101, "order_id": 11, "amount": 80.0},
+        {"payment_id": 102, "order_id": 12, "amount": 5.0},
+        {"payment_id": 103, "order_id": 13, "amount": 75.0},
+        {"payment_id": 104, "order_id": 14, "amount": 120.0}
+      ]
+    },
+    "relationships": [
+      ["customers", "customer_id", "orders", "customer_id"],
+      ["orders", "order_id", "payments", "order_id"]
+    ],
+    "target_table": "customers",
+    "entity_id": "customer_id",
+    "target": "churn",
+    "max_depth": 2
+  }
+}

@@ -8,16 +8,18 @@
 #   ./run.sh verify ceptron-xs-discovery cdfm-base
 #
 # Per model, from a cold start (empty venv: no torch, no adapter, no weights):
-#   1. pfnstudio run <slug> --install-deps                    its own sample
-#   2. pfnstudio run <slug> --install-deps --input input.json input.json built
-#      from the sample the running model declares (warm: reuses 1's cache)
-#   3. with VERIFY_SITE set (e.g. https://pfnstudio.com): the site's
-#      /models/<slug>/input.json must equal the file from 2
-# A case passes only when the command exits 0 AND prints a result.
+#   1. pfnstudio run <slug> -y                 the sample the model declares
+#   2. pfnstudio run <slug> -y --input sample  the sample input pfnstudio ships
+#      (warm: reuses 1's cache)
+#   3. every shipped samples/<slug>/<task>.json must equal the sample the
+#      running model declares for that task (converted by sample_to_inputs);
+#      the declared ones are written to $WORK/declared/ — copy them into
+#      packages/cli/pfnstudio/samples/ when a model's sample changes
+# A run passes only when the command exits 0 AND prints a result.
 #
 # Env: PYTHON (default python3, needs 3.10+), PFNSTUDIO_API_URL (marketplace,
-# default hosted), VERIFY_SITE, VERIFY_BASEMODELS (undeployed adapters, see
-# below), VERIFY_DIR (work dir, default a new temp dir;
+# default hosted), VERIFY_BASEMODELS (undeployed adapters, see below),
+# VERIFY_DIR (work dir, default a new temp dir;
 # kept afterwards for the logs), VERIFY_PORT (daemon port, default 11541 so a
 # daemon already on 11440 is never touched).
 #
@@ -29,10 +31,9 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="${PYTHON:-python3}"
 API="${PFNSTUDIO_API_URL:-https://cloud.pfnstudio.com/api}"
-SITE="${VERIFY_SITE:-}"
 PORT="${VERIFY_PORT:-11541}"
 WORK="${VERIFY_DIR:-$(mktemp -d -t pfnstudio-verify.XXXXXX)}"
-mkdir -p "$WORK/logs" "$WORK/inputs"
+mkdir -p "$WORK/logs" "$WORK/declared"
 VENV="$WORK/venv"
 DAEMON="http://127.0.0.1:$PORT"
 
@@ -87,27 +88,43 @@ for x in json.load(sys.stdin):
 fi
 echo "→ models: ${SLUGS[*]}"
 
-# Build input.json — {task, inputs} — from the sample the loaded model
-# declares for its first task. Exit 3 when it declares none.
-make_input() {
-  "$VENV/bin/python" - "$DAEMON/models/$1/capabilities" "$2" <<'PY'
+# Write the sample the loaded model declares for each task, as the
+# {task, inputs} request run sends, to $WORK/declared/<slug>/<task>.json, and
+# compare each with the file pfnstudio ships. Prints MATCH, or what differs.
+# Exit 3 when the model declares no sample at all.
+check_samples() {
+  "$VENV/bin/python" - "$DAEMON/models/$1/capabilities" "$WORK/declared/$1" "$1" <<'PY'
 import json, sys, urllib.request
+from pathlib import Path
+
+from pfnstudio.samples import _DIR
+from pfnstudio_core.serving.samples import sample_to_inputs
 
 body = json.load(urllib.request.urlopen(sys.argv[1], timeout=120))
 r = body.get("result", body) if isinstance(body, dict) else {}
 caps = r.get("capabilities") if isinstance(r, dict) else None
-if not isinstance(caps, dict) or not caps:
+out, slug = Path(sys.argv[2]), sys.argv[3]
+declared = {}
+for task, spec in (caps or {}).items():
+    sample = (spec or {}).get("sample")
+    if isinstance(sample, dict):
+        kind = ((spec or {}).get("input_schema") or {}).get("kind")
+        declared[task] = {"task": task, "inputs": sample_to_inputs(kind, sample)}
+if not declared:
     sys.exit(3)
-task = next(iter(caps))
-spec = caps[task] or {}
-sample = spec.get("sample")
-if not isinstance(sample, dict):
-    sys.exit(3)
-# The same conversion `run` and the website's input.json apply.
-from pfnstudio_core.serving.samples import sample_to_inputs
-
-kind = (spec.get("input_schema") or {}).get("kind")
-json.dump({"task": task, "inputs": sample_to_inputs(kind, sample)}, open(sys.argv[2], "w"))
+out.mkdir(parents=True, exist_ok=True)
+problems = []
+for task, req in declared.items():
+    (out / f"{task}.json").write_text(json.dumps(req))
+    shipped = _DIR / slug / f"{task}.json"
+    if not shipped.is_file():
+        problems.append(f"{task} not shipped")
+    elif json.loads(shipped.read_text()) != req:
+        problems.append(f"{task} differs")
+for f in sorted((_DIR / slug).glob("*.json")) if (_DIR / slug).is_dir() else []:
+    if f.stem not in declared:
+        problems.append(f"{f.stem} shipped, not declared")
+print("MATCH" if not problems else "DIFF " + "; ".join(problems))
 PY
 }
 
@@ -115,7 +132,7 @@ PY
 run_case() {
   local log="$1"; shift
   local t0=$SECONDS
-  ( cd "$WORK" && "$VENV/bin/pfnstudio" run "$@" --install-deps ) >"$log" 2>&1
+  ( cd "$WORK" && "$VENV/bin/pfnstudio" run "$@" -y ) >"$log" 2>&1
   local rc=$?
   if [[ $rc -eq 0 ]] && grep -q "Result" "$log"; then
     echo "PASS $((SECONDS - t0))s"
@@ -131,29 +148,20 @@ for slug in "${SLUGS[@]}"; do
   a=$(run_case "$WORK/logs/$slug.sample.log" "$slug")
   echo "   own sample:  $a  (logs/$slug.sample.log)"
 
-  inp="$WORK/inputs/$slug.json"
   b="SKIP no daemon"; c="-"
   if curl -fsS "$DAEMON/healthz" >/dev/null 2>&1; then
-    make_input "$slug" "$inp" 2>>"$WORK/logs/$slug.input.log"
+    c=$(check_samples "$slug" 2>>"$WORK/logs/$slug.input.log")
     case $? in
       0)
-        b=$(run_case "$WORK/logs/$slug.input.log" "$slug" --input "$inp")
-        if [[ -n "$SITE" ]]; then
-          if curl -fsS "$SITE/models/$slug/input.json" -o "$WORK/inputs/$slug.site.json" 2>/dev/null \
-             && "$VENV/bin/python" -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])) == json.load(open(sys.argv[2])) else 1)' \
-                  "$inp" "$WORK/inputs/$slug.site.json"; then
-            c="MATCH"
-          else
-            c="FAIL"
-          fi
-        fi
+        b=$(run_case "$WORK/logs/$slug.input.log" "$slug" --input sample)
+        [[ "$c" == MATCH ]] || c="FAIL $c"
         ;;
-      3) b="SKIP no sample declared" ;;
-      *) b="FAIL capabilities unreadable" ;;
+      3) b="SKIP no sample declared"; c="-" ;;
+      *) b="FAIL capabilities unreadable"; c="-" ;;
     esac
   fi
-  echo "   --input:     $b  (logs/$slug.input.log)"
-  [[ -n "$SITE" ]] && echo "   site input:  $c"
+  echo "   --input sample:     $b  (logs/$slug.input.log)"
+  echo "   shipped = declared: $c"
   ROWS+=("$(printf '%-24s %-14s %-26s %s' "$slug" "$a" "$b" "$c")")
   [[ "$a$b$c" == *FAIL* ]] && fail=1
 
@@ -163,10 +171,10 @@ for slug in "${SLUGS[@]}"; do
 done
 
 echo
-printf '%-24s %-14s %-26s %s\n' MODEL "OWN SAMPLE" "--input input.json" "SITE input.json"
+printf '%-24s %-14s %-26s %s\n' MODEL "OWN SAMPLE" "--input sample" "SHIPPED = DECLARED"
 printf '%s\n' "${ROWS[@]}"
 echo
-echo "logs: $WORK/logs   daemon: $WORK/daemon.log"
+echo "logs: $WORK/logs   daemon: $WORK/daemon.log   declared samples: $WORK/declared"
 if [[ $fail -ne 0 ]]; then
   echo "✗ not ready to publish"
   exit 1

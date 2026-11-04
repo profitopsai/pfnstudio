@@ -23,6 +23,8 @@ dependencies = [
   "pyyaml>=6.0",
   "jsonschema>=4.21",
   "requests>=2.31",
+  # `run` checks the model's requirements.txt against what is installed.
+  "packaging>=23",
   # serving: the local model server `pfnstudio run` starts (FastAPI + uvicorn).
   "pfnstudio-core[serving]>=0.9.10",
 ]
