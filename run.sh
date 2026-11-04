@@ -12,6 +12,7 @@
 #   ./run.sh build   <cli|core|all>  build wheel + sdist (uv build)
 #   ./run.sh publish <cli|core>      build + upload to PyPI (twine)
 #   ./run.sh tag     <cli|core>      git tag <prefix><version> + push (CI publish)
+#   ./run.sh verify  [slug...]       run every open model from a fresh venv
 #
 # Twine resolution honors $VENV/twine if set (existing operator flow),
 # else a `twine` on PATH, else `uv run --with twine twine`. PyPI creds
@@ -112,6 +113,9 @@ pfnstudio operator interface — release ops for the two packages.
   ./run.sh build   <cli|core|all>  build wheel + sdist (uv build)
   ./run.sh publish <cli|core>      build + upload to PyPI (twine)
   ./run.sh tag     <cli|core>      git tag <prefix><version> + push (CI publish)
+  ./run.sh verify  [slug...]       before publishing: build this checkout into a
+                                   fresh venv and run each open model, cold, on
+                                   its sample and with --input (scripts/verify-models.sh)
 
 Packages:  cli = pfnstudio   ·   core = pfnstudio-core
 Twine:     honors $VENV/twine if set, else `twine`, else `uv run --with twine`.
@@ -124,6 +128,7 @@ case "${1:-}" in
   build)   shift;   cmd_build "${1:-all}" ;;
   publish) shift;   cmd_publish "$@" ;;
   tag)     shift;   cmd_tag "$@" ;;
+  verify)  shift;   exec "$ROOT/scripts/verify-models.sh" "$@" ;;
   ""|-h|--help|help) usage ;;
   *) echo "unknown command '$1'" >&2; usage; exit 1 ;;
 esac
