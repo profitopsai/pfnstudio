@@ -16,6 +16,8 @@
 #      the declared ones are written to $WORK/declared/ — copy them into
 #      packages/cli/pfnstudio/samples/ when a model's sample changes
 # A run passes only when the command exits 0 AND prints a result.
+# A model whose listing says requires.gpu (gpuMemoryGB) is SKIPPED on a machine without a GPU
+# that large — reported, never counted as a failure.
 #
 # Env: PYTHON (default python3, needs 3.10+), PFNSTUDIO_API_URL (marketplace,
 # default hosted), VERIFY_BASEMODELS (undeployed adapters, see below),
@@ -88,6 +90,27 @@ for x in json.load(sys.stdin):
 fi
 echo "→ models: ${SLUGS[*]}"
 
+# A model whose listing says it needs a GPU (requires.gpu, requires.gpuMemoryGB) is
+# skipped, not failed, on a machine without one that large — the catalog lists models
+# by what they do, not by what this machine can run.
+GPU_GB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | sort -n | tail -1)
+GPU_GB=$(( ${GPU_GB:-0} / 1024 ))
+echo "→ GPU memory here: ${GPU_GB} GB"
+LISTINGS_JSON="$WORK/listings.json"
+curl -fsS "$API/marketplace/listings" > "$LISTINGS_JSON" 2>/dev/null || echo '[]' > "$LISTINGS_JSON"
+# needs_gpu <slug> → prints the reason to skip, or nothing when this machine can run it
+needs_gpu() {
+  "$VENV/bin/python" - "$LISTINGS_JSON" "$1" "$GPU_GB" <<'PY'
+import json, sys
+rows = json.load(open(sys.argv[1])); slug, have = sys.argv[2], int(sys.argv[3])
+req = next((x.get("requires") or {} for x in rows if isinstance(x, dict) and x.get("slug") == slug), {})
+if req.get("gpu"):
+    need = int(req.get("gpuMemoryGB") or 1)
+    if have < need:
+        print(f"needs a GPU with >= {need} GB (this machine: {have} GB)")
+PY
+}
+
 # Write the sample the loaded model declares for each task, as the
 # {task, inputs} request run sends, to $WORK/declared/<slug>/<task>.json, and
 # compare each with the file pfnstudio ships. Prints MATCH, or what differs.
@@ -145,6 +168,12 @@ declare -a ROWS
 fail=0
 for slug in "${SLUGS[@]}"; do
   echo "── $slug"
+  skip=$(needs_gpu "$slug")
+  if [[ -n "$skip" ]]; then
+    echo "   SKIP: $skip"
+    ROWS+=("$(printf '%-24s %-14s %-26s %s' "$slug" "SKIP" "SKIP" "$skip")")
+    continue
+  fi
   a=$(run_case "$WORK/logs/$slug.sample.log" "$slug")
   echo "   own sample:  $a  (logs/$slug.sample.log)"
 
@@ -179,4 +208,4 @@ if [[ $fail -ne 0 ]]; then
   echo "✗ not ready to publish"
   exit 1
 fi
-echo "✓ every model ran both ways"
+echo "✓ every model this machine can run ran both ways (SKIP rows need a larger GPU)"
