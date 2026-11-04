@@ -4,7 +4,7 @@
 
     from pfnstudio import client
     client.ensure_running()                 # spawn `python -m pfnstudio.daemon` if needed
-    info = client.load("cdfm-base")   # or "slug:tag"
+    info = client.load("cdfm")   # or "slug:tag"
     out = client.predict(info["slug"], {"task": "discover", "inputs": {...}})
 
 Only ``requests`` is imported at module load — importing this module is cheap.

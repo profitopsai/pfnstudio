@@ -6,7 +6,7 @@ Registration (cli.py, right after ``app = typer.Typer(...)``)::
     from .store_cli import store_commands
     store_commands(app)
 
-The verbs land on the ROOT app (``pfnstudio pull t0-alpha-base``), not under a
+The verbs land on the ROOT app (``pfnstudio pull t0-alpha``), not under a
 sub-app. ``pull``, ``ls`` and ``rm`` work without the daemon; ``ps`` and the
 loaded? column need it; ``show`` asks the daemon for capabilities when it runs
 and otherwise takes the same in-process path ``run`` uses. ``rm`` is the only

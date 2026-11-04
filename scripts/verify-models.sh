@@ -5,7 +5,7 @@
 # to — before anything reaches PyPI.
 #
 #   ./run.sh verify                      every open model in the marketplace
-#   ./run.sh verify ceptron-xs-discovery cdfm-base
+#   ./run.sh verify ceptron-xs-discovery cdfm
 #
 # Per model, from a cold start (empty venv: no torch, no adapter, no weights):
 #   1. pfnstudio run <slug> -y                 the sample the model declares

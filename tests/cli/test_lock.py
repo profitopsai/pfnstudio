@@ -20,10 +20,10 @@ from pfnstudio.lock import (
 @pytest.mark.parametrize(
     ("ref", "expected"),
     [
-        ("timee-base", ("timee-base", "latest")),
-        ("timee-base:latest", ("timee-base", "latest")),
-        ("cdfm-base:v0.2", ("cdfm-base", "v0.2")),
-        ("  t0-alpha-base  ", ("t0-alpha-base", "latest")),
+        ("timee", ("timee", "latest")),
+        ("timee:latest", ("timee", "latest")),
+        ("cdfm:v0.2", ("cdfm", "v0.2")),
+        ("  t0-alpha  ", ("t0-alpha", "latest")),
         ("a_b.c:1", ("a_b.c", "1")),
     ],
 )
@@ -80,7 +80,7 @@ def _fake_checkpoint(root: Path, name: str = "org--timee--main--0123456789abcdef
 
 def _lock(root: Path, bundle: Path, ckpt: Path, **over: object) -> dict:
     kw: dict = dict(
-        slug="timee-base",
+        slug="timee",
         tag="latest",
         fm_project="timee",
         base_adapter="timee",
@@ -99,7 +99,7 @@ def test_build_lock_shape_and_determinism(tmp_path: Path) -> None:
     second = _lock(tmp_path, bundle, ckpt)
 
     assert first["schema"] == 1
-    assert first["slug"] == "timee-base" and first["tag"] == "latest"
+    assert first["slug"] == "timee" and first["tag"] == "latest"
     assert first["fmProject"] == "timee" and first["baseAdapter"] == "timee"
     # __pycache__ is not part of the served bundle; lock.json is not yet written.
     assert first["bundle"]["files"] == 2

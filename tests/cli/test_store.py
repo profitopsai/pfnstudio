@@ -154,15 +154,15 @@ def test_remove_refuses_shared_checkpoint(roots):
 def test_remove_keeps_bundle_shared_by_sibling_slug(roots):
     """Several listings share one fmProject (t0 alpha/beta/gamma): removing one
     slug forgets its listing + weights but keeps the bundle for the others."""
-    bdir = _bundle("t0-alpha-base", "t0-alpha", REF_A, lock=False)
-    _bundle("t0-beta-base", "t0-alpha", REF_B, lock=False)
-    assert sorted(r["slug"] for r in store.list_models()) == ["t0-alpha-base", "t0-beta-base"]
-    res = store.remove("t0-beta-base")
+    bdir = _bundle("t0-alpha", "t0-alpha", REF_A, lock=False)
+    _bundle("t0-beta", "t0-alpha", REF_B, lock=False)
+    assert sorted(r["slug"] for r in store.list_models()) == ["t0-alpha", "t0-beta"]
+    res = store.remove("t0-beta")
     assert res["removed_bundle"] is None and res["kept_bundle"] == bdir and bdir.is_dir()
     assert res["removed_checkpoints"] == [store.checkpoint_cache_dir(REF_B)]
     assert store.checkpoint_cache_dir(REF_A).is_dir()
-    assert [r["slug"] for r in store.list_models()] == ["t0-alpha-base"]
-    assert not (bdir / "listings" / "t0-beta-base.json").exists()
+    assert [r["slug"] for r in store.list_models()] == ["t0-alpha"]
+    assert not (bdir / "listings" / "t0-beta.json").exists()
     # Removing by fmProject id drops the whole bundle and the remaining weights.
     res = store.remove("t0-alpha")
     assert res["removed_bundle"] == bdir and not bdir.exists()
