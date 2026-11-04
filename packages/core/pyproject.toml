@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pfnstudio-core"
-version = "0.9.9"
+version = "0.9.10"
 description = "Core abstractions for PFN Studio — Prior, Model, Eval, Run, and the block registry."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -32,7 +32,12 @@ dependencies = [
 
 [project.optional-dependencies]
 torch = ["torch>=2.2"]
-serving = ["fastapi>=0.115", "uvicorn[standard]>=0.30"]
+serving = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  # serving.hf pulls hf:// checkpoints (every base model `pfnstudio run` loads).
+  "huggingface_hub>=0.23",
+]
 dev = ["pytest>=8.0", "pytest-cov>=5.0", "ruff>=0.4"]
 
 [project.urls]

@@ -1206,29 +1206,23 @@ def _ensure_torch(*, install: bool, ref: str) -> None:
     importlib.invalidate_caches()
 
 
-# A sample's own labels, never part of the model input (pfnstudio_core.serving.samples).
-_SAMPLE_META_KEYS = frozenset({"name", "description", "task", "source", "expected"})
-# Input kinds whose sample IS the predict input ({rows, columns[, target]}). Other
-# kinds (e.g. context_query) shape their sample for the studio form, which
-# transforms it before predict — those models run their own check on {task}.
-_SAMPLE_AS_INPUT_KINDS = frozenset({"table", "table_with_target"})
-
-
 def _default_payload(task: str | None, spec: Any) -> dict[str, Any]:
     """What `run` sends when the caller gave no --input.
 
-    A task that declares a table-shaped sample runs ON that sample — the same
-    data the studio's Try-it opens with — so a model whose predict needs real
-    rows (CDFM, Ceptron, RDB-PFN) answers instead of erroring. Any other task
-    gets the bare ``{task}`` and the adapter runs its own self-check.
+    A task that declares a sample runs ON that sample — the same data the
+    studio's "Try with sample" sends — so a model whose predict needs real
+    data answers instead of erroring. A task without one gets the bare
+    ``{task}`` and the adapter runs its own self-check.
     """
+    from pfnstudio_core.serving.samples import sample_to_inputs
+
     if not task:
         return {}
     spec = spec if isinstance(spec, dict) else {}
     schema = spec.get("input_schema") if isinstance(spec.get("input_schema"), dict) else {}
     sample = spec.get("sample")
-    if schema.get("kind") in _SAMPLE_AS_INPUT_KINDS and isinstance(sample, dict):
-        inputs = {k: v for k, v in sample.items() if k not in _SAMPLE_META_KEYS}
+    if isinstance(sample, dict):
+        inputs = sample_to_inputs(schema.get("kind"), sample)
         if inputs:
             return {"task": task, "inputs": inputs}
     return {"task": task}

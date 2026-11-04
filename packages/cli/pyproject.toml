@@ -24,7 +24,7 @@ dependencies = [
   "jsonschema>=4.21",
   "requests>=2.31",
   # serving: the local model server `pfnstudio run` starts (FastAPI + uvicorn).
-  "pfnstudio-core[serving]>=0.9.8",
+  "pfnstudio-core[serving]>=0.9.10",
 ]
 
 [project.optional-dependencies]
