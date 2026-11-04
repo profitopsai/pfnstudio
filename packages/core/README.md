@@ -6,13 +6,16 @@ The Python contract for PFN Studio FM projects.
 from pfnstudio_core import Prior, Model, Run, register_block, register_prior, register_scorer
 from pfnstudio_core.scorers.base import DatasetScorer, ScorerResult
 
+
 @register_prior("my_prior")
 class MyPrior(Prior):
     def sample(self, seed: int): ...
 
+
 @register_block("my_attention")
 class MyAttention:
     def __init__(self, d_model: int, n_heads: int): ...
+
 
 # Paper-specific scorer — ships in the template beside evals/<slug>.yaml.
 @register_scorer("my_eval")

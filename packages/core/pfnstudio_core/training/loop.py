@@ -524,9 +524,7 @@ def train_pfn(
             if n == 0:
                 return
             torch.save(sd, os.path.join(ckpt_dir, f"model_step_{at_step}.pt"))
-            torch.save(
-                optim.state_dict(), os.path.join(ckpt_dir, f"optim_step_{at_step}.pt")
-            )
+            torch.save(optim.state_dict(), os.path.join(ckpt_dir, f"optim_step_{at_step}.pt"))
             _recent_snap_steps.append(at_step)
             while len(_recent_snap_steps) > _CKPT_KEEP:
                 old = _recent_snap_steps.pop(0)
@@ -567,9 +565,7 @@ def train_pfn(
                 )
                 for name, mod in getattr(model, "modules", []):
                     block_sd = {
-                        k[len(name) + 1 :]: v
-                        for k, v in flat.items()
-                        if k.startswith(name + ".")
+                        k[len(name) + 1 :]: v for k, v in flat.items() if k.startswith(name + ".")
                     }
                     if not block_sd:
                         continue
@@ -586,9 +582,7 @@ def train_pfn(
                             sub_sd = block_sd
                         sub.load_state_dict(sub_sd, strict=False)
                 optim.load_state_dict(
-                    torch.load(
-                        os.path.join(ckpt_dir, f"optim_step_{at}.pt"), map_location=device
-                    )
+                    torch.load(os.path.join(ckpt_dir, f"optim_step_{at}.pt"), map_location=device)
                 )
                 _recent_snap_steps[:] = _cand[-_CKPT_KEEP:]
                 start_step = at
@@ -596,7 +590,7 @@ def train_pfn(
                     "log",
                     line=f"resumed from checkpoint at step {at} ({steps - at} steps remaining)",
                 )
-        except Exception as e:  # noqa: BLE001 — never fail a run over a resume attempt
+        except Exception as e:
             start_step = 0
             _emit(
                 "log",

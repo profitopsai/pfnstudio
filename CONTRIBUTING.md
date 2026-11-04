@@ -65,6 +65,7 @@ A prior is a synthetic data generator. To add one:
    import numpy as np
    from pfnstudio_core import Prior, register_prior
 
+
    @register_prior("your_prior_id")
    class YourPrior(Prior):
        def sample(self, *, seed: int, num_points: int = 100, **_) -> dict[str, Any]:
