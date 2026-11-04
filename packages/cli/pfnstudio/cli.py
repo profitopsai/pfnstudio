@@ -900,9 +900,9 @@ def run(
     install_deps: bool = typer.Option(
         False,
         "--install-deps",
-        help="pip-install the adapter's requirements.txt (its upstream model "
-        "package) before running. Off by default: nothing is installed silently. "
-        "Model form only.",
+        help="pip-install what the model needs before running: PyTorch when it "
+        "is missing, then the adapter's requirements.txt (its upstream model "
+        "package). Off by default: nothing is installed silently. Model form only.",
     ),
 ) -> None:
     """Run a training manifest, or a base-model PFN from the marketplace.
@@ -1171,6 +1171,40 @@ def _find_basemodels_dir(fm_project: str, override: Path | None) -> Path | None:
     return None
 
 
+# Same spec as the `torch` extra of pfnstudio-core (`pip install "pfnstudio[torch]"`).
+_TORCH_SPEC = "torch>=2.2"
+
+
+def _ensure_torch(*, install: bool, ref: str) -> None:
+    """Every base model runs on PyTorch, which plain `pip install pfnstudio`
+    leaves out (it is a large download the authoring commands never need).
+
+    With ``install`` (``--install-deps``) a missing torch is pip-installed into
+    this Python. Without it, stop with the one-line fix instead of failing later
+    inside the daemon on a bare ImportError. Torch already present: no-op.
+    """
+    import importlib
+    import importlib.util
+    import subprocess
+    import sys
+
+    if importlib.util.find_spec("torch") is not None:
+        return
+    if not install:
+        console.print(
+            "[red]PyTorch isn't installed, and every base model needs it.[/red]\n"
+            f"  [bold]pfnstudio run {ref} --install-deps[/bold]   [dim]installs it, then the model's own packages[/dim]\n"
+            '  [dim]or[/dim] pip install "pfnstudio[torch]"'
+        )
+        raise typer.Exit(code=1)
+    console.print(
+        f"[dim]Installing PyTorch ({_TORCH_SPEC}) — needed by every base model; "
+        "a one-time download of 1–3 GB…[/dim]"
+    )
+    subprocess.check_call([sys.executable, "-m", "pip", "install", _TORCH_SPEC])
+    importlib.invalidate_caches()
+
+
 def _run_model(
     ref: str,
     api_url: str,
@@ -1287,7 +1321,10 @@ def _run_model(
         )
         return
 
-    # 2b) Upstream model package — only on request.
+    # 2b) PyTorch, then the upstream model package — only on request. Torch is
+    #     checked before the (large) checkpoint download so a missing install
+    #     fails fast with the fix, not after minutes of pulling weights.
+    _ensure_torch(install=install_deps, ref=f"{slug}:{tag}")
     req_file = fm_dir / "requirements.txt"
     if install_deps and req_file.is_file() and req_file.read_text(encoding="utf-8").strip():
         import subprocess as _subprocess
