@@ -38,6 +38,6 @@ class HFSpacesAdapter(ComputeAdapter):
             "run_yaml": str(run_yaml.relative_to(project_root)),
             "note": (
                 "Space repo and SDK type need per-org config. "
-                "Configure .priorstudio/hf_spaces.yaml — see docs/compute.md."
+                "Configure .pfnstudio/hf_spaces.yaml — see docs/compute.md."
             ),
         }

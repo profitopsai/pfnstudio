@@ -1,3 +1,11 @@
 """Built-in architecture blocks. Imported eagerly to register them on package load."""
 
-from . import grid, heads, tabular, transformer  # noqa: F401  (registers on import)
+from . import (  # noqa: F401  (registers on import)
+    cross_attention,
+    grid,
+    heads,
+    helpers,
+    tabular,
+    time_encoding,
+    transformer,
+)

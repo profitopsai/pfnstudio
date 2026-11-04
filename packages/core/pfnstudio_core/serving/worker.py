@@ -1,6 +1,6 @@
 """HTTP worker that holds one trained checkpoint in memory and serves
 predictions over a loopback port. Used by Phase 1 of the deployments
-system: Studio spawns one process per Deployment, polls /healthz until
+system: Studio spawns one process per Deployment, polls /health until
 'ready', and forwards user predict() calls via /predict.
 
 Event-stream protocol:
@@ -66,10 +66,11 @@ def _make_handler(loader: Any) -> type[BaseHTTPRequestHandler]:
             self.wfile.write(data)
 
         def do_GET(self) -> None:
-            if self.path == "/healthz":
+            if self.path in ("/health", "/healthz"):
                 # Worker is fully constructed before do_GET can be
                 # invoked (server isn't started until __init__ done),
                 # so reaching here means the loader is ready.
+                # /healthz kept as alias for older probes.
                 self._send_json(200, {"status": "ready"})
                 return
             self._send_json(404, {"error": "not_found", "path": self.path})
@@ -132,7 +133,6 @@ class _AdapterServeLoader:
         project_root: Path,
         checkpoint_dir: Path,
     ) -> None:
-        import torch
         import yaml
 
         from ..registry import discover_in_project
@@ -142,13 +142,16 @@ class _AdapterServeLoader:
         discover_in_project(project_root)
         try:
             data = yaml.safe_load(Path(manifest_path).read_text(encoding="utf-8")) or {}
-        except Exception:  # noqa: BLE001
+        except Exception:
             data = {}
         hp = (data.get("hyperparams") or {}) if isinstance(data, dict) else {}
         self._hp: dict[str, Any] = hp if isinstance(hp, dict) else {}
         self._adapter = resolve_adapter(adapter_name, self._hp.get("adapterModule"))
-        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        from .device import maybe_torch_compile, resolve_serve_device
+
+        self._device = resolve_serve_device()
         self._model = self._adapter.load_model(Path(checkpoint_dir), self._hp, self._device)
+        self._model = maybe_torch_compile(self._model)
         if hasattr(self._model, "eval"):
             self._model.eval()
 
@@ -193,25 +196,16 @@ def serve(
     construction is emitted as a load-stage error event with exit 1
     so the parent can surface the reason on the Deployment row.
     """
-    from ..training.predict import ModelLoader, _peek_run_adapter
+    from .loader import create_serve_loader
 
     _emit("starting", host=host, port=port, run_dir=str(project_root))
 
     try:
-        adapter_name = _peek_run_adapter(manifest_path)
-        if adapter_name:
-            # Adapter base model (TCPFN, …): serve through the adapter's own
-            # predict()/capabilities(), not the block-model ModelLoader (which
-            # 400s 'invalid_payload' on the {task, inputs} envelope).
-            loader = _AdapterServeLoader(
-                adapter_name, manifest_path, project_root, checkpoint_dir
-            )
-        else:
-            loader = ModelLoader(
-                manifest_path=manifest_path,
-                project_root=project_root,
-                checkpoint_dir=checkpoint_dir,
-            )
+        loader = create_serve_loader(
+            manifest_path=manifest_path,
+            project_root=project_root,
+            checkpoint_dir=checkpoint_dir,
+        )
     except BaseException as e:
         traceback.print_exc(file=sys.stderr)
         _emit("error", stage="load", message=f"{type(e).__name__}: {e}")

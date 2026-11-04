@@ -52,12 +52,11 @@ Architecture is config-driven. A model YAML names blocks by string; the registry
 ```python
 from pfnstudio_core import register_block
 
+
 @register_block("my_attention")
 class MyAttention:
-    def __init__(self, d_model: int, n_heads: int):
-        ...
-    def __call__(self, x):
-        ...
+    def __init__(self, d_model: int, n_heads: int): ...
+    def __call__(self, x): ...
 ```
 
 ```yaml

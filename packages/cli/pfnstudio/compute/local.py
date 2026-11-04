@@ -221,8 +221,34 @@ class LocalAdapter(ComputeAdapter):
             if scorer is None:
                 scorer = BUILTIN_SCORERS.get(eval_spec.id) or BUILTIN_SCORERS.get(eval_id)
             if scorer is None:
-                # No scorer for this slug — fine, the eval is synthetic-only
-                # (metadata card with no real-data scoring step).
+                # No scorer resolved. Two very different situations share this
+                # branch, and conflating them silently is a real footgun:
+                #   (a) an intentional metadata-only eval — declares NO metrics,
+                #       just a benchmark card. Nothing to compute; skip quietly.
+                #   (b) an eval that DECLARES metrics but ships no scorer .py
+                #       (empty / missing @register_scorer). The author expects
+                #       those metrics to be filled — and nothing will. Silently
+                #       dropping it means the run reports no metrics with no clue
+                #       why, which is exactly the failure users hit.
+                # Distinguish them: (b) surfaces as a skipped eval with a reason
+                # the UI/logs can show, instead of vanishing.
+                declared = list(getattr(eval_spec, "metrics", None) or [])
+                if declared:
+                    names = ", ".join(getattr(m, "name", str(m)) for m in declared)
+                    reason = (
+                        f"eval '{eval_id}' declares {len(declared)} metric(s) "
+                        f"({names}) but no scorer is registered for it — add "
+                        f'evals/{eval_id}.py with @register_scorer("{eval_id}"). '
+                        f"Nothing computed these metrics."
+                    )
+                    out[eval_id] = {
+                        "metrics": {},
+                        "meta": {},
+                        "skipped": True,
+                        "skip_reason": reason,
+                    }
+                    _emit_log(f"eval {eval_id} skipped: {reason}")
+                # else: genuinely metadata-only (no metrics declared) — skip quietly.
                 continue
 
             try:

@@ -17,7 +17,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any, ClassVar
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class PriorParameter(BaseModel):
@@ -33,6 +33,19 @@ class PriorOutputVariable(BaseModel):
     type: str
     shape: str | None = None
     description: str | None = None
+    # Optional declarative mapping into the trainer's vocabulary. Lets
+    # domain authors keep their natural naming (`lower_bound`,
+    # `treatment`, `gene_expression`, etc.) while still telling the
+    # trainer "this column is the regression target." When omitted the
+    # trainer falls back to shape-based autodetection on a probe sample.
+    #
+    # Valid values:
+    #   features        → trainer X
+    #   target          → trainer y
+    #   labels          → trainer labels
+    #   adjacency       → trainer A
+    #   context_length  → trainer n_ctx
+    role: str | None = None
 
 
 class PriorOutputs(BaseModel):
@@ -63,6 +76,36 @@ class PriorSpec(BaseModel):
     # Promptable axes declared by this prior. Empty list (default) =
     # non-promptable; sample() ignores any tag argument.
     axes: list[PriorAxisRef] = Field(default_factory=list)
+    # Declarative Try-it / Inference manifest, same shape as ModelSpec.capabilities
+    # (task key → {label, input_schema, output_schema, sample?}). A native studio
+    # run reads this when its model declares none — so a prior can own the task
+    # schema for the data shape it produces. See predict.run_inference.
+    capabilities: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("parameters", mode="before")
+    @classmethod
+    def _strip_reserved_keys(cls, v: Any) -> Any:
+        """Strip UI-only reserved keys from the parameters dict before
+        validation. The Studio frontend uses ``__prefix__`` keys to
+        co-locate metadata that doesn't fit elsewhere yet:
+
+          __axes__                    — promptable axes (UI-only storage
+                                        ahead of a proper Prisma column)
+          __compatible_task_types__   — Run composer eval-picker filter
+
+        These are not PriorParameter shapes; they're advisory metadata
+        the trainer doesn't consume. Filtering here lets the YAML
+        round-trip cleanly through Pydantic without forcing the frontend
+        to maintain a parallel "real parameters only" view. Add new
+        reserved keys here as the UI introduces them.
+        """
+        if not isinstance(v, dict):
+            return v
+        return {
+            k: vv
+            for k, vv in v.items()
+            if not (isinstance(k, str) and k.startswith("__") and k.endswith("__"))
+        }
 
 
 class Prior(ABC):

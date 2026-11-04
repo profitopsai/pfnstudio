@@ -19,7 +19,7 @@ class MLflowTracker(Tracker):
             import mlflow
         except ImportError:
             return
-        experiment = config.get("tracking", {}).get("mlflow_experiment") or "priorstudio"
+        experiment = config.get("tracking", {}).get("mlflow_experiment") or "pfnstudio"
         mlflow.set_experiment(experiment)
         mlflow.start_run(run_name=run_id)
         flat = _flatten(config)

@@ -1,5 +1,10 @@
 """PFN Studio core abstractions."""
 
+# Read back from the installed distribution so __version__ always matches the
+# wheel; the hardcoded literal it replaces said 0.8.0 through the 0.9.x line.
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
+
 from . import axes as _axes  # noqa: F401  # registers built-in axes on import
 from . import blocks as _blocks  # noqa: F401  # registers built-in blocks on import
 from .axes import (
@@ -33,7 +38,10 @@ from .registry import (
 )
 from .run import Run, RunSpec
 
-__version__ = "0.8.0"
+try:
+    __version__ = _pkg_version("pfnstudio-core")
+except PackageNotFoundError:  # running from a source tree that is not installed
+    __version__ = "0.0.0+dev"
 
 __all__ = [
     "UNKNOWN",

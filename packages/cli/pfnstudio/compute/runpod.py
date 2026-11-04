@@ -33,6 +33,6 @@ class RunPodAdapter(ComputeAdapter):
             "run_yaml": str(run_yaml.relative_to(project_root)),
             "note": (
                 "RunPod pod template + on-start script need per-org config. "
-                "Configure .priorstudio/runpod.yaml — see docs/compute.md."
+                "Configure .pfnstudio/runpod.yaml — see docs/compute.md."
             ),
         }
