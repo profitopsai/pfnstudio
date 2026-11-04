@@ -13,7 +13,7 @@ from pfnstudio import client, daemon
 
 
 def test_mount_path_builder() -> None:
-    assert daemon.mount_path("cdfm-base") == "/models/cdfm-base"
+    assert daemon.mount_path("cdfm") == "/models/cdfm"
     assert daemon.mount_path("timee.base_v2") == "/models/timee.base_v2"
 
 
@@ -28,8 +28,8 @@ def test_mount_path_rejects_unsafe_slugs(bad: str) -> None:
 
 def test_parse_ref_fallback_without_lock(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, "pfnstudio.lock", None)  # force ImportError
-    assert daemon.parse_ref("cdfm-base") == ("cdfm-base", None)
-    assert daemon.parse_ref("cdfm-base:v1.2") == ("cdfm-base", "v1.2")
+    assert daemon.parse_ref("cdfm") == ("cdfm", None)
+    assert daemon.parse_ref("cdfm:v1.2") == ("cdfm", "v1.2")
     with pytest.raises(ValueError):
         daemon.parse_ref("   ")
 
@@ -65,8 +65,8 @@ def test_normalize_tier(raw, expected) -> None:
 
 
 def test_run_manifest_matches_run_command_trick(tmp_path: Path) -> None:
-    p = daemon.write_run_manifest(tmp_path, "cdfm-base", "cdfm")
-    assert p == tmp_path / "runs" / "cdfm-base.yaml"
+    p = daemon.write_run_manifest(tmp_path, "cdfm", "cdfm")
+    assert p == tmp_path / "runs" / "cdfm.yaml"
     text = p.read_text(encoding="utf-8")
     assert "  adapter: cdfm\n" in text and "  baseAdapter: cdfm\n" in text
     import yaml

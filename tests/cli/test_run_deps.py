@@ -55,7 +55,7 @@ def test_nothing_missing_asks_nothing(monkeypatch: pytest.MonkeyPatch, tmp_path:
     _torch(monkeypatch, present=True)
     calls = _pip_calls(monkeypatch)
     (tmp_path / "requirements.txt").write_text("typer>=0.1\n")
-    cli._ensure_deps(tmp_path / "requirements.txt", yes=False, ref="cdfm-base:latest")
+    cli._ensure_deps(tmp_path / "requirements.txt", yes=False, ref="cdfm:latest")
     assert calls == []
 
 
@@ -66,7 +66,7 @@ def test_yes_installs_torch_then_the_requirements(
     calls = _pip_calls(monkeypatch)
     req = tmp_path / "requirements.txt"
     req.write_text("surely-not-installed-pkg-xyz==1.0\n")
-    cli._ensure_deps(req, yes=True, ref="cdfm-base:latest")
+    cli._ensure_deps(req, yes=True, ref="cdfm:latest")
     assert [c[1:4] for c in calls] == [["-m", "pip", "install"]] * 2
     assert calls[0][-1] == cli._TORCH_SPEC
     assert calls[1][-2:] == ["-r", str(req)]
@@ -79,10 +79,10 @@ def test_no_terminal_stops_with_the_yes_command(
     calls = _pip_calls(monkeypatch)
     _tty(monkeypatch, False)
     with pytest.raises(typer.Exit) as exc:
-        cli._ensure_deps(None, yes=False, ref="cdfm-base:latest")
+        cli._ensure_deps(None, yes=False, ref="cdfm:latest")
     assert exc.value.exit_code == 1 and calls == []
     out = capsys.readouterr().out
-    assert "pfnstudio run cdfm-base:latest -y" in out
+    assert "pfnstudio run cdfm:latest -y" in out
 
 
 def test_terminal_asks_and_a_no_installs_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -92,7 +92,7 @@ def test_terminal_asks_and_a_no_installs_nothing(monkeypatch: pytest.MonkeyPatch
     asked: list[str] = []
     monkeypatch.setattr(typer, "confirm", lambda q, default=False: asked.append(q) or False)
     with pytest.raises(typer.Exit):
-        cli._ensure_deps(None, yes=False, ref="cdfm-base:latest")
+        cli._ensure_deps(None, yes=False, ref="cdfm:latest")
     assert asked and calls == []
 
 
@@ -101,5 +101,5 @@ def test_terminal_yes_installs(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = _pip_calls(monkeypatch)
     _tty(monkeypatch, True)
     monkeypatch.setattr(typer, "confirm", lambda q, default=False: default)
-    cli._ensure_deps(None, yes=False, ref="cdfm-base:latest")
+    cli._ensure_deps(None, yes=False, ref="cdfm:latest")
     assert len(calls) == 1 and calls[0][-1] == cli._TORCH_SPEC

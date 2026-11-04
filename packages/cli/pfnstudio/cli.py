@@ -862,7 +862,7 @@ def run(
         ...,
         metavar="RUN_YAML|MODEL[:TAG]|NAME",
         help="A run YAML to execute (runs/<slug>.yaml), a marketplace base-model "
-        "ref — 'cdfm-base', 't0-alpha-base:latest' — or the name of a "
+        "ref — 'cdfm', 't0-alpha:latest' — or the name of a "
         "model made with `pfnstudio create`.",
     ),
     project: Path = typer.Option(
