@@ -99,12 +99,15 @@ caps = r.get("capabilities") if isinstance(r, dict) else None
 if not isinstance(caps, dict) or not caps:
     sys.exit(3)
 task = next(iter(caps))
-sample = (caps[task] or {}).get("sample")
+spec = caps[task] or {}
+sample = spec.get("sample")
 if not isinstance(sample, dict):
     sys.exit(3)
-meta = {"name", "description", "task", "source", "expected"}
-inputs = {k: v for k, v in sample.items() if k not in meta}
-json.dump({"task": task, "inputs": inputs}, open(sys.argv[2], "w"))
+# The same conversion `run` and the website's input.json apply.
+from pfnstudio_core.serving.samples import sample_to_inputs
+
+kind = (spec.get("input_schema") or {}).get("kind")
+json.dump({"task": task, "inputs": sample_to_inputs(kind, sample)}, open(sys.argv[2], "w"))
 PY
 }
 
