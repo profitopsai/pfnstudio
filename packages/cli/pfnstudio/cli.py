@@ -341,7 +341,7 @@ def push(
     """Bulk-upload artifacts from a local project directory to PFN Studio.
 
     Example:
-        pfnstudio push my-tcpfn-priors --project-id tcpfn-port --token ps_xxx
+        pfnstudio push my-domain-priors --project-id my-project --token ps_xxx
     """
     import requests
     import yaml as _y
