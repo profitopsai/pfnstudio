@@ -1,0 +1,17 @@
+{
+  "task": "classify",
+  "inputs": {
+    "rows": [
+      {"f0": 0.9, "f1": 12.0, "f2": 1.0, "label": "churn"},
+      {"f0": 0.2, "f1": 3.0, "f2": 0.0, "label": "stay"},
+      {"f0": 0.8, "f1": 10.0, "f2": 1.0, "label": "churn"},
+      {"f0": 0.1, "f1": 2.0, "f2": 0.0, "label": "stay"},
+      {"f0": 0.95, "f1": 15.0, "f2": 1.0, "label": "churn"},
+      {"f0": 0.15, "f1": 4.0, "f2": 0.0, "label": "stay"},
+      {"f0": 0.7, "f1": 9.0, "f2": 1.0, "label": "churn"},
+      {"f0": 0.25, "f1": 5.0, "f2": 0.0, "label": "stay"}
+    ],
+    "columns": ["f0", "f1", "f2"],
+    "target": "label"
+  }
+}

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import typer
 from rich.console import Console
@@ -15,6 +16,7 @@ from .create_cli import alias_path, create_commands
 from .lint import lint_project
 from .lock import build_lock, parse_model_ref, write_lock
 from .runner import runner_app
+from .samples import SAMPLE_INPUT, bundled_sample, bundled_sample_tasks
 from .scaffold import scaffold_project
 from .store_cli import store_commands
 from .tracking import select_trackers
@@ -893,16 +895,18 @@ def run(
     input_json: Path = typer.Option(
         None,
         "--input",
-        help="JSON payload to run instead of the built-in self-diagnostic "
-        "(same shape the web Try-it posts). Omit to run the model's own "
-        "held-out sample. Model form only.",
+        help="A {task, inputs} JSON file to run (the shape the web Try-it posts). "
+        "'--input sample' runs the sample input shipped with pfnstudio and prints "
+        "its path, to copy for your own data. Omit to run the sample the model "
+        "declares. Model form only.",
     ),
-    install_deps: bool = typer.Option(
+    yes: bool = typer.Option(
         False,
-        "--install-deps",
-        help="pip-install what the model needs before running: PyTorch when it "
-        "is missing, then the adapter's requirements.txt (its upstream model "
-        "package). Off by default: nothing is installed silently. Model form only.",
+        "-y",
+        "--yes",
+        help="Install what the model needs without asking. By default `run` "
+        "lists the missing packages (PyTorch, the model's own) and asks first; "
+        "with no terminal it stops unless -y is given. Model form only.",
     ),
 ) -> None:
     """Run a training manifest, or a base-model PFN from the marketplace.
@@ -938,7 +942,7 @@ def run(
     elif alias_path(what).is_file():
         _run_alias(what, task, input_json)
     else:
-        _run_model(what, api_url, basemodels, task, input_json, install_deps)
+        _run_model(what, api_url, basemodels, task, input_json, yes)
 
 
 def _run_manifest(manifest: Path, project: Path | None, target: str | None) -> None:
@@ -1175,34 +1179,108 @@ def _find_basemodels_dir(fm_project: str, override: Path | None) -> Path | None:
 _TORCH_SPEC = "torch>=2.2"
 
 
-def _ensure_torch(*, install: bool, ref: str) -> None:
-    """Every base model runs on PyTorch, which plain `pip install pfnstudio`
-    leaves out (it is a large download the authoring commands never need).
+def _unmet_requirements(lines: list[str]) -> list[str]:
+    """The requirement lines this Python does not already satisfy (name
+    installed at a matching version, markers honoured). pip options (``-r``,
+    ``--index-url``…) are left to pip and never count as unmet; a line this
+    cannot parse counts as unmet, so pip gets to judge it."""
+    from importlib.metadata import PackageNotFoundError, version
 
-    With ``install`` (``--install-deps``) a missing torch is pip-installed into
-    this Python. Without it, stop with the one-line fix instead of failing later
-    inside the daemon on a bare ImportError. Torch already present: no-op.
+    from packaging.requirements import InvalidRequirement, Requirement
+
+    unmet: list[str] = []
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith(("#", "-")):
+            continue
+        line = line.split(" #", 1)[0].strip()
+        try:
+            req = Requirement(line)
+        except InvalidRequirement:
+            unmet.append(line)
+            continue
+        if req.marker is not None and not req.marker.evaluate():
+            continue
+        try:
+            have = version(req.name)
+        except PackageNotFoundError:
+            unmet.append(line)
+            continue
+        if req.specifier and not req.specifier.contains(have, prereleases=True):
+            unmet.append(line)
+    return unmet
+
+
+def _ensure_deps(req_file: Path | None, *, yes: bool, ref: str) -> None:
+    """Install what this model needs and this Python lacks: PyTorch (every base
+    model runs on it; plain `pip install pfnstudio` leaves it out) and the
+    adapter's requirements.txt (its upstream model package).
+
+    Never changes an environment unasked: it lists the packages and asks in a
+    terminal (Enter = yes); ``-y`` skips the question; with no terminal (CI, a
+    pipe) it stops with the ``-y`` command. Nothing missing: no question.
     """
     import importlib
     import importlib.util
     import subprocess
     import sys
 
-    if importlib.util.find_spec("torch") is not None:
-        return
-    if not install:
-        console.print(
-            "[red]PyTorch isn't installed, and every base model needs it.[/red]\n"
-            f"  [bold]pfnstudio run {ref} --install-deps[/bold]   [dim]installs it, then the model's own packages[/dim]\n"
-            '  [dim]or[/dim] pip install "pfnstudio[torch]"'
-        )
-        raise typer.Exit(code=1)
-    console.print(
-        f"[dim]Installing PyTorch ({_TORCH_SPEC}) — needed by every base model; "
-        "a one-time download of 1–3 GB…[/dim]"
+    need_torch = importlib.util.find_spec("torch") is None
+    reqs = (
+        _unmet_requirements(req_file.read_text(encoding="utf-8").splitlines())
+        if req_file is not None and req_file.is_file()
+        else []
     )
-    subprocess.check_call([sys.executable, "-m", "pip", "install", _TORCH_SPEC])
+    if not need_torch and not reqs:
+        return
+    console.print(f"\n[bold]{ref}[/bold] needs packages this Python doesn't have:")
+    if need_torch:
+        console.print(
+            f"  • {_TORCH_SPEC}  [dim](PyTorch — every base model runs on it; 1–3 GB)[/dim]"
+        )
+    for r in reqs:
+        console.print(f"  • {r}")
+    console.print(
+        f"[dim]into {sys.executable}. Use a virtual environment of its own so these "
+        "don't change another project's packages.[/dim]"
+    )
+    if not yes:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            console.print(
+                "[red]Not installing without a yes.[/red] Re-run with -y to install them:\n"
+                f"  [bold]pfnstudio run {ref} -y[/bold]"
+            )
+            raise typer.Exit(code=1)
+        if not typer.confirm("Install them?", default=True):
+            console.print("[dim]Nothing installed.[/dim]")
+            raise typer.Exit(code=1)
+    if need_torch:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", _TORCH_SPEC])
+    if reqs and req_file is not None:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", str(req_file)])
     importlib.invalidate_caches()
+
+
+def _default_payload(task: str | None, spec: Any) -> dict[str, Any]:
+    """What `run` sends when the caller gave no --input.
+
+    A task that declares a sample runs ON that sample — the same data the
+    studio's "Try with sample" sends — so a model whose predict needs real
+    data answers instead of erroring. A task without one gets the bare
+    ``{task}`` and the adapter runs its own self-check.
+    """
+    from pfnstudio_core.serving.samples import sample_to_inputs
+
+    if not task:
+        return {}
+    spec = spec if isinstance(spec, dict) else {}
+    schema = spec.get("input_schema") if isinstance(spec.get("input_schema"), dict) else {}
+    sample = spec.get("sample")
+    if isinstance(sample, dict):
+        inputs = sample_to_inputs(schema.get("kind"), sample)
+        if inputs:
+            return {"task": task, "inputs": inputs}
+    return {"task": task}
 
 
 def _run_model(
@@ -1211,7 +1289,7 @@ def _run_model(
     basemodels: Path | None,
     task: str | None,
     input_json: Path | None,
-    install_deps: bool,
+    yes: bool,
 ) -> None:
     """The `pfnstudio run <slug>[:tag]` path: resolve listing → bundle →
     checkpoint, pin them in lock.json, then run the adapter's sample through
@@ -1321,16 +1399,10 @@ def _run_model(
         )
         return
 
-    # 2b) PyTorch, then the upstream model package — only on request. Torch is
-    #     checked before the (large) checkpoint download so a missing install
-    #     fails fast with the fix, not after minutes of pulling weights.
-    _ensure_torch(install=install_deps, ref=f"{slug}:{tag}")
-    req_file = fm_dir / "requirements.txt"
-    if install_deps and req_file.is_file() and req_file.read_text(encoding="utf-8").strip():
-        import subprocess as _subprocess
-
-        console.print(f"[dim]Installing adapter dependencies from {req_file}…[/dim]")
-        _subprocess.check_call([_sys.executable, "-m", "pip", "install", "-r", str(req_file)])
+    # 2b) PyTorch and the upstream model package, asked for once. Checked before
+    #     the (large) checkpoint download so the question comes first, not
+    #     after minutes of pulling weights.
+    _ensure_deps(fm_dir / "requirements.txt", yes=yes, ref=f"{slug}:{tag}")
 
     # 3) Resolve the checkpoint into a local dir (pulls + caches from HF).
     console.print("\n[dim]Pulling checkpoint…[/dim]", style=None)
@@ -1376,7 +1448,7 @@ def _run_model(
                 console.print(
                     "[dim]Install the adapter's upstream package into the daemon's Python:[/dim]\n"
                     f"  pip install -r {fm_dir / 'requirements.txt'}\n"
-                    "[dim]or re-run with[/dim] --install-deps[dim]; a daemon that was already "
+                    "[dim]or re-run and answer yes to the install; a daemon that was already "
                     "running needs a restart to see new packages.[/dim]"
                 )
             elif detail.get("hint"):
@@ -1418,14 +1490,26 @@ def _run_model(
     chosen = task or (next(iter(caps)) if caps else None)
 
     # 4b) Run it. --input if given, else the adapter's self-diagnostic
-    #     (empty inputs → the adapter samples a held-out task and reports
-    #     predicted-vs-oracle, proving the real weights work).
-    if input_json is not None:
+    #     on its declared sample when the task has a table-shaped one, else
+    #     the adapter's own check (empty inputs → it samples a held-out task
+    #     and reports predicted-vs-oracle, proving the real weights work).
+    if input_json is not None and str(input_json) == SAMPLE_INPUT and not input_json.exists():
+        path = bundled_sample(slug, chosen)
+        if path is None:
+            have = bundled_sample_tasks(slug)
+            err(
+                f"pfnstudio ships no sample input for {slug}"
+                + (f" task '{chosen}' (it has: {', '.join(have)})." if have else ".")
+            )
+            raise typer.Exit(code=1)
+        console.print(
+            f"[dim]Input: {path}\nCopy it, put your data in, and pass --input your.json.[/dim]"
+        )
+        payload = _json.loads(path.read_text(encoding="utf-8"))
+    elif input_json is not None:
         payload = _json.loads(input_json.read_text())
-    elif chosen:
-        payload = {"task": chosen}
     else:
-        payload = {}
+        payload = _default_payload(chosen, caps.get(chosen) if chosen else None)
 
     console.print(f"\n[dim]Running{f' {chosen}' if chosen else ''}…[/dim]")
     try:
@@ -1501,10 +1585,8 @@ def _run_alias(name: str, task: str | None, input_json: Path | None) -> None:
 
     if input_json is not None:
         payload = _json.loads(input_json.read_text())
-    elif chosen:
-        payload = {"task": chosen}
     else:
-        payload = {}
+        payload = _default_payload(chosen, caps.get(chosen) if chosen else None)
 
     console.print(f"\n[dim]Running{f' {chosen}' if chosen else ''} in the studio…[/dim]")
     # Inference blocks until the studio's runner answers; no client-side deadline.

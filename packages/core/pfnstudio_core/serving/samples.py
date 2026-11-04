@@ -97,6 +97,66 @@ _EXPECTED_FIELDS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
 _META_KEYS = frozenset({"name", "description", "task", "source", "expected"})
 
 
+# Sample fields a form shows as a text box of rows ("1, 0.2, 3\n0, 0.5, 1"):
+# an adapter's sample may ship them as that text.
+_MATRIX_FIELDS = frozenset({"rows", "context", "query", "observations", "anomalies"})
+
+
+def _parse_matrix(text: str) -> list[list[Any]]:
+    """Text rows → a list of rows, split on commas, tabs or spaces: the same
+    split the studio's Try-it form applies. A cell that is not a number stays
+    a string."""
+    import re
+
+    out: list[list[Any]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        row: list[Any] = []
+        for cell in re.split(r"[\s,\t]+", line):
+            try:
+                row.append(float(cell))
+            except ValueError:
+                row.append(cell)
+        out.append(row)
+    return out
+
+
+def sample_to_inputs(kind: str | None, sample: dict[str, Any]) -> dict[str, Any]:
+    """The predict ``inputs`` a sample stands for — what Try-it sends when a
+    user runs the sample, for clients without the form (``pfnstudio run``).
+
+    A sample holds FORM fields (see the module docstring), so text matrices
+    are parsed into rows, a ``columns`` string becomes a list, and a
+    ``context_query`` context splits the way the form splits it: treatment =
+    first column, covariates = the middle, outcome = last. Everything else
+    passes through. The website's /models/<slug>/input.json applies the same
+    rules; keep the two in step.
+    """
+    inputs: dict[str, Any] = {k: v for k, v in sample.items() if k not in _META_KEYS}
+    for k in _MATRIX_FIELDS & inputs.keys():
+        if isinstance(inputs[k], str):
+            inputs[k] = _parse_matrix(inputs[k])
+    cols = inputs.get("columns")
+    if isinstance(cols, str):
+        import re
+
+        inputs["columns"] = [c for c in re.split(r"[\s,\t]+", cols) if c]
+    if kind == "context_query":
+        ctx = inputs.get("context")
+        if isinstance(ctx, list) and ctx and all(isinstance(r, list) and len(r) >= 3 for r in ctx):
+            inputs["context"] = {
+                "t": [r[0] for r in ctx],
+                "X": [r[1:-1] for r in ctx],
+                "y": [r[-1] for r in ctx],
+            }
+        qry = inputs.get("query")
+        if isinstance(qry, list):
+            inputs["query"] = {"X": qry}
+    return inputs
+
+
 def known_kinds() -> frozenset[str]:
     return frozenset(_KIND_FIELDS)
 

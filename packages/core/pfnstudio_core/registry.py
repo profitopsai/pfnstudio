@@ -17,8 +17,18 @@ _ADAPTERS: dict[str, type] = {}
 
 def _register(table: dict[str, type], name: str) -> Callable[[type[T]], type[T]]:
     def decorator(cls: type[T]) -> type[T]:
-        if name in table and table[name] is not cls:
-            raise ValueError(f"Already registered under '{name}': {table[name]!r}")
+        prev = table.get(name)
+        # The same file imported again (discover_in_project names a module
+        # after its path) re-registers: the local daemon loads one adapter
+        # bundle for each model that shares it (t0-alpha/-beta/-gamma).
+        # Anything else under a taken name is a clash.
+        same_source = (
+            prev is not None
+            and prev.__module__ == cls.__module__
+            and prev.__qualname__ == cls.__qualname__
+        )
+        if prev is not None and prev is not cls and not same_source:
+            raise ValueError(f"Already registered under '{name}': {prev!r}")
         table[name] = cls
         return cls
 
