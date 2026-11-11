@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pfnstudio"
-version = "0.8.24"
+version = "0.8.25"
 description = "CLI for the PFN Studio framework — scaffold, validate, lint, and run prior-fitted foundation model projects."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -26,7 +26,7 @@ dependencies = [
   # `run` checks the model's requirements.txt against what is installed.
   "packaging>=23",
   # serving: the local model server `pfnstudio run` starts (FastAPI + uvicorn).
-  "pfnstudio-core[serving]>=0.9.10",
+  "pfnstudio-core[serving]>=0.9.11",
 ]
 
 [project.optional-dependencies]

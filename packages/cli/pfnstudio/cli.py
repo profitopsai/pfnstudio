@@ -931,9 +931,15 @@ def run(
     `pfnstudio run <name>` for a model made with `pfnstudio create` sends the
     request to that model's run in the studio (it lives there, not locally).
     """
-    # A path (an existing file, a .yaml/.yml name, or anything with a separator)
-    # is a run manifest; a name `create` wrote an alias for is a studio model;
-    # every other token is a marketplace model ref.
+    # An inference repo (hf://<org>/<repo>, or a folder holding an inference manifest.json)
+    # runs its released network here; a path (an existing file, a .yaml/.yml name,
+    # or anything with a separator) is a run manifest; a name `create` wrote an
+    # alias for is a studio model; every other token is a marketplace model ref.
+    from pfnstudio_core.inference import is_inference_ref
+
+    if is_inference_ref(what):
+        _run_inference(what, task, input_json)
+        return
     is_manifest = (
         Path(what).is_file() or what.endswith((".yaml", ".yml")) or "/" in what or "\\" in what
     )
@@ -943,6 +949,42 @@ def run(
         _run_alias(what, task, input_json)
     else:
         _run_model(what, api_url, basemodels, task, input_json, yes)
+
+
+def _run_inference(ref: str, task: str | None, input_json: Path | None) -> None:
+    """Ask an inference repo's released network one question (PFN Studio's publish-inference).
+
+    ``--input`` is a request JSON, or the ``{task, inputs}`` shape the web Try-it posts; with
+    no --input (or ``--input sample``) the manifest's own example for the task runs, built from
+    published measurements. ``--task`` is predict, recommend or diagnose (default: the request's
+    ``question``, else predict). The answer prints as JSON.
+    """
+    from pfnstudio_core.inference import InferenceError, load_inference
+    from pfnstudio_core.inference.world import Refusal, json_safe
+
+    try:
+        model = load_inference(ref)
+    except InferenceError as e:
+        console.print(f"[red]✗[/red] {e}")
+        raise typer.Exit(code=1) from e
+    if input_json is None or str(input_json) == "sample":
+        examples = model.m.get("examples") or {}
+        name = task or "predict"
+        if name not in examples:
+            console.print(f"[red]✗[/red] this repo ships no example for '{name}': give --input")
+            raise typer.Exit(code=1)
+        request = dict(examples[name])
+    else:
+        request = json.loads(Path(input_json).read_text())
+        if "inputs" in request and "task" in request:
+            task, request = task or request["task"], dict(request["inputs"])
+    request["question"] = task or request.get("question") or "predict"
+    try:
+        answer = model.ask(request)
+    except Refusal as e:
+        console.print(f"[red]refused:[/red] {e}")
+        raise typer.Exit(code=2) from e
+    print(json.dumps(json_safe(answer), indent=1))
 
 
 def _run_manifest(manifest: Path, project: Path | None, target: str | None) -> None:
