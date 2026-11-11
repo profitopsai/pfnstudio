@@ -2,6 +2,23 @@
 
 Versions are per-package; tags are `core-v<version>` and `cli-v<version>`.
 
+## pfnstudio-core 0.9.11 (core)
+
+### Added
+- **Inference repos** (`pfnstudio_core.inference`). PFN Studio's *publish-inference* writes a
+  model's inference-only repo: `model.pt2` (the network as a `torch.export` graph),
+  `manifest.json` and a model card, with no source code. `load_inference("hf://<org>/<repo>")`
+  (or a local folder) returns its runtime; for world models it answers predict, recommend and
+  diagnose, refuses inputs outside the world's ranges or catalogs, and can recompute the
+  release's own score on a measurement set (`selfcheck`).
+
+## pfnstudio 0.8.25 (CLI)
+
+### Added
+- **`pfnstudio run hf://<org>/<repo>`** runs an inference repo: `--task predict|recommend|diagnose`,
+  `--input request.json` (or the `{task, inputs}` shape); with no `--input` it runs the
+  manifest's example. Needs pfnstudio-core >= 0.9.11 and torch (`pip install "pfnstudio[torch]"`).
+
 ## pfnstudio-core 0.9.5 (core)
 
 ### Fixed
